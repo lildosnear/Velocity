@@ -45,14 +45,17 @@ async function fetchPoolPage(fromIndex: number, limit: number): Promise<RawPool[
 }
 
 /**
- * Scan simple pools on the exchange. Ref testnet carries a modest number
- * of pools, so a bounded scan (default 500 pools, pages of 100) is fine.
- * Pages are fetched in parallel batches of 5 and the completed scan is
- * cached for a minute, so repeat quotes and watcher ticks do not
- * rescan the exchange (a full rescan per quote used to take ~20s and
- * trip public RPC rate limits). DCL pools are scanned in dcl.ts.
+ * Scan simple pools on the exchange. The scan bound comes from config
+ * and is network aware: testnet carries a modest number of pools (bound
+ * 500), while mainnet held 9014 pools at the 2026-11-07 check, with
+ * important pairs far past a testnet sized bound (the deep USDt pool
+ * against wNEAR sits at index 6063), so the mainnet bound is 10000.
+ * Pages of 100 are fetched in parallel batches of 5 and the completed
+ * scan is cached for a minute, so repeat quotes and watcher ticks do
+ * not rescan the exchange (a full rescan per quote used to take ~20s
+ * and trip public RPC rate limits). DCL pools are scanned in dcl.ts.
  */
-export async function scanPools(maxPools = 500): Promise<RefPool[]> {
+export async function scanPools(maxPools = config.simplePoolScanLimit): Promise<RefPool[]> {
   if (poolScanDone && Date.now() - poolScanAt < POOL_SCAN_TTL_MS) {
     return [...poolCache.values()].sort((a, b) => a.id - b.id);
   }

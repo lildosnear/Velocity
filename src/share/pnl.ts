@@ -117,6 +117,16 @@ function mascotCircle(): Promise<Buffer> {
   return cometCircleCache;
 }
 
+/** Network pill printed on the card. Pure, unit tested: mainnet trades are real, so the card says NEAR; testnet cards say NEAR TESTNET. */
+export function networkPill(network: string): string {
+  return network === "mainnet" ? "NEAR" : "NEAR TESTNET";
+}
+
+/** Network wording for the card caption. Pure, unit tested. */
+export function networkCaptionName(network: string): string {
+  return network === "mainnet" ? "NEAR" : "NEAR testnet";
+}
+
 function buildSvg(d: PnlCardData, tier: PnlTier): string {
   const pillW = 40 + tier.label.length * 20;
   const refLink = d.botUsername ? `https://t.me/${d.botUsername}?start=${d.referralTag ?? "ref"}` : "";
@@ -124,7 +134,7 @@ function buildSvg(d: PnlCardData, tier: PnlTier): string {
     config.referralEnabled && d.botUsername
       ? `Get ${config.refereeDiscountPct}% off trading fees`
       : "Trade NEAR tokens on Telegram";
-  const networkPill = config.network === "mainnet" ? "NEAR" : "NEAR TESTNET";
+  const networkPillText = networkPill(config.network);
   return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <radialGradient id="glow" cx="0.12" cy="0.18" r="0.55">
@@ -145,7 +155,7 @@ function buildSvg(d: PnlCardData, tier: PnlTier): string {
   <circle cx="151" cy="135" r="98" fill="#101014" stroke="${tier.color}" stroke-width="3"/>
   <text x="272" y="122" font-family="${FONT}" font-size="44" font-weight="800" letter-spacing="4" fill="#FFFFFF">VELOCITY</text>
   <rect x="272" y="150" width="218" height="36" rx="18" fill="#141417" stroke="#2A2A2E" stroke-width="1.5"/>
-  <text x="381" y="174" text-anchor="middle" font-family="${FONT}" font-size="21" font-weight="700" letter-spacing="3" fill="#9A9AA0">${networkPill}</text>
+  <text x="381" y="174" text-anchor="middle" font-family="${FONT}" font-size="21" font-weight="700" letter-spacing="3" fill="#9A9AA0">${networkPillText}</text>
   <text x="1140" y="86" text-anchor="end" font-family="${FONT}" font-size="26" fill="#9A9AA0">${esc(hookLine)}</text>
   ${refLink ? `<text x="1140" y="130" text-anchor="end" font-family="${FONT}" font-size="26" font-weight="700" fill="#FFFFFF">${esc(refLink)}</text>` : ""}
   ${d.footerNote ? `<text x="1140" y="168" text-anchor="end" font-family="${FONT}" font-size="22" fill="#6E6E73">${esc(d.footerNote)}</text>` : ""}
@@ -174,7 +184,7 @@ export async function renderPnlCard(d: PnlCardData): Promise<Buffer> {
 export function pnlCaption(d: PnlCardData): string {
   const tier = pnlTier(d.pnlPct);
   const emoji = tier.id === "rekt" ? "💀" : tier.id === "legendary" ? "⚡⚡" : "⚡";
-  const net = config.network === "mainnet" ? "NEAR" : "NEAR testnet";
+  const net = networkCaptionName(config.network);
   return `${fmtPct(d.pnlPct)} on $${d.symbol} ${emoji}\nTraded on ${net} with Velocity.`;
 }
 

@@ -12,6 +12,9 @@ async function main() {
   if (net === "mainnet") {
     console.warn("WARNING: mainnet mode. Real funds. Trade small.");
   }
+  if (!config.tradingEnabled) {
+    console.warn("Trading is PAUSED (TRADING_ENABLED=false). Info commands only, no buys or sells will execute.");
+  }
 
   // Fail fast if the NEAR RPC is unreachable.
   const height = await rpcBlockHeight();

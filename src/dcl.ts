@@ -66,16 +66,17 @@ let dclScanDone = false;
 let dclScanned = 0;
 
 /**
- * Scan DCL pools on the configured DCL exchange. Mainnet carries
- * thousands of pools, so the scan is bounded (default 2000 pools, pages
- * of 100 fetched in parallel batches of 8). The completed scan is
- * cached for a minute, the same pattern as the simple pool scan, and
- * the cache also holds when the scan finds nothing, so testnet does
- * not re-probe the missing contract on every quote. Returns an empty
- * list when the contract does not exist on this network, which is the
- * testnet case today.
+ * Scan DCL pools on the configured DCL exchange. The scan bound comes
+ * from config and is network aware: mainnet held about 6,300 pools at
+ * the 2026-11-07 check, so the mainnet bound is 6500; testnet has no
+ * DCL contract at all. Pages of 100 are fetched in parallel batches of
+ * 8. The completed scan is cached for a minute, the same pattern as
+ * the simple pool scan, and the cache also holds when the scan finds
+ * nothing, so testnet does not re-probe the missing contract on every
+ * quote. Returns an empty list when the contract does not exist on
+ * this network, which is the testnet case today.
  */
-export async function scanDclPools(maxPools = 2000): Promise<DclPool[]> {
+export async function scanDclPools(maxPools = config.dclPoolScanLimit): Promise<DclPool[]> {
   if (dclScanDone && Date.now() - dclScanAt < 60_000) {
     return [...dclCache.values()];
   }

@@ -41,16 +41,21 @@ on the NEAR value of each trade, whichever pool kind fills it.
     quoted about 401 NEARLY tokens in the NEARLY pool). No DCL
     deployment exists on testnet today: the candidate testnet contract
     ids hold no contract code, so on testnet the DCL scan finds no
-    pools and simple pool routes carry the trades. DCL execution
-    itself has therefore not been settled by a landed transaction; it
-    runs the first time the bot trades on mainnet, using the swap
-    message format verified from real mainnet DCL transactions.
+    pools and simple pool routes carry the trades. DCL execution was
+    audited end to end against live mainnet transaction traces on
+    2026-11-07 (see the MAINNET section), but it has not yet been
+    settled by a landed Velocity transaction; that proof needs a
+    funded mainnet trade.
   - Testnet USDC and USDT are the Ref fake stablecoins at
     usdc.fakes.testnet and usdt.fakes.testnet (symbols USDC.e and
-    USDT.e, 6 decimals). There is no canonical testnet USDC. Both ids
-    are configurable in .env.
+    USDT.e, 6 decimals). There is no canonical testnet USDC. On
+    mainnet the defaults are the bridged USDC token and
+    usdt.tether-token.near, chosen from live liquidity evidence (see
+    the MAINNET section). Both ids are configurable in .env.
   - Everything runs on play money until you switch NEAR_NETWORK to
-    mainnet in .env, which also swaps the default contract ids.
+    mainnet in .env, which also swaps the default contract ids, scan
+    bounds and per trade cap. Mainnet is ready as of 2026-11-07; the
+    MAINNET section below is the runbook for switching over.
 
 ## Setup (Windows, PowerShell)
 
@@ -278,6 +283,20 @@ on the record. Nothing is ever stranded silently.
 Registrar facts, verified live on testnet on 2026-11-07 (see the live
 proof below): any funded account may call create_account on the
 registrar (testnet here, near on mainnet), there is no whitelist. The
+mainnet side of that claim was verified from evidence on 2026-11-07:
+the near account runs the standard near-linkdrop contract, its
+create_account method exists on chain, and the deployed source at the
+exact revision recorded in the contract metadata carries no caller
+whitelist and no minimum deposit assert; it creates the account,
+adds the given key and forwards the attached deposit in full, with a
+refund to the caller if creation fails. Mainnet protocol config
+confirms only the registrar side can create top level names
+(min_allowed_top_level_account_length is 65, longer than any legal
+account id), which the registrar contract satisfies because every
+.near name is its own subaccount. So the registrar flow above works
+on mainnet unchanged, with the .near suffix and the same 0.01 NEAR
+default deposit; the protocol minimum is only the new account's
+storage cost, well under that default. The
 deposit attached to the call becomes the new account's starting
 balance in full; the testnet registrar charges nothing at creation
 and even a zero deposit lands, so NAME_CREATION_DEPOSIT_NEAR is a
@@ -352,7 +371,154 @@ FaBh8iB6AgpCPrNZPXuL4W9KFzbogJseHaBbDUbUw4k6); the sweep moved the
 name, leaving only the 0.003 NEAR gas reserve (0.002955 after gas)
 on the old address, which the sweep report states openly.
 
-## Security notes (read before mainnet is even a thought)
+## MAINNET
+
+Velocity is mainnet ready as of 2026-11-07. With NEAR_NETWORK=mainnet
+and the mainnet env block, every feature runs against the real
+contracts below. Everything in this section was verified live by RPC
+in read only mode; no mainnet funds were spent. The proofs that still
+need a funded trade are listed plainly at the end.
+
+### The verified mainnet contract set
+
+Each entry verified live on 2026-11-07 (account exists with contract
+code, metadata read, pool presence checked):
+
+- Ref exchange: v2.ref-finance.near. get_number_of_pools read 9014
+  simple pools. Config scans all of them on mainnet (bound 10000);
+  the testnet bound of 500 would miss most mainnet pairs.
+- DCL exchange: dclv2.ref-labs.near. About 6,300 pools at check time
+  (the bot scanned 6497 entries inside its 6500 bound, the count
+  includes pools with no liquidity). Config scans 6500 on mainnet.
+- wNEAR: wrap.near (metadata symbol wNEAR, 24 decimals).
+- USDC default: a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.factory.bridge.near
+  (metadata name "Bridged USDC", symbol USDC.e, 6 decimals). The
+  account usdc.near exists but holds no contract code and answers no
+  ft_metadata, so it is not a token and is never used. The bridged
+  token carries the depth: simple pool 3 against wrap.near held about
+  10,991 wNEAR and 40,105 USDC.e, and its DCL pool at fee tier 2000
+  quoted 363968 raw for 0.1 wNEAR, better than the simple pool's
+  363788, so the route finder picks DCL for that pair.
+- USDT default: usdt.tether-token.near (metadata name "Tether USD",
+  symbol USDt, 6 decimals), the canonical Tether issued token.
+  Simple pool 6063 against wrap.near held about 46,885 wNEAR and
+  169,047 USDt, and it has liquid DCL pools at fee tiers 100 and
+  2000. The bridged USDT.e token also exists with a deep simple pool
+  (pool 4) but no liquid DCL pools, so the canonical token wins on
+  route coverage. Through the bot's own route finder, 0.1 wNEAR
+  quoted 365630 raw USDt via a simple pool on 2026-11-07.
+- Registrar for named wallets: the near account, running the standard
+  near-linkdrop contract (see the named wallets section for the
+  evidence). velocitybot.near was still free to register at check
+  time and is the recommended project account.
+
+### DCL execution audit (2026-11-07)
+
+The DCL swap path could never execute on testnet (no deployment
+exists there), so for mainnet it was audited end to end against the
+live contract and real transaction traces:
+
+- Pool id format token_x|token_y|fee and the Swap message shape were
+  re-confirmed from receipts executing on dclv2.ref-labs.near in live
+  blocks; they match what the bot builds.
+- Storage: the bot used to deposit storage on the DCL exchange
+  before a first DCL swap. That is now removed. A live trace
+  (transaction EcQntbawww1C3sxzme3PPPkibTzn3V2p4CboXJMjCFry) shows a
+  swapper whose storage_balance_of on the DCL exchange is null
+  completing a swap and receiving the output directly. Registration
+  (bounds minimum 0.5 NEAR) is only needed for the exchange's other
+  features, which aggregators use. Leaving the deposit in would have
+  taken 0.5 NEAR out of a user wallet for no reason.
+- Refunds: in the same trace, the swapper sent 300000000 raw and the
+  pool used 217151273; the unused 82848727 came straight back through
+  the token contract's resolve transfer, and the full output landed
+  in the swapper's wallet in the same transaction. Slippage
+  protection is the min_output_amount inside the swap message: if
+  the pool cannot pay it, the swap fails inside the transfer call
+  and the whole input is refunded the same way. The bot also checks
+  that tokens actually arrived after every swap and says so plainly
+  when they did not.
+- Quotes: the bot's own route finder on mainnet config picked the
+  DCL route for wNEAR to USDC (363968 raw, beating the simple pool)
+  and the simple route for wNEAR to USDT (365630 raw, beating DCL)
+  in the live mainnet smoke run. Route selection follows the money,
+  not a preference.
+
+### Safety rails on mainnet
+
+- TRADING_ENABLED (default true). Set it false and buys, sells,
+  trader alert buttons and AI copy executions all refuse plainly
+  with a trading paused message, while balances, watch lists and
+  info commands keep working. The bot logs the paused state at boot.
+- MAX_TRADE_NEAR defaults to 5 on mainnet (10 on testnet). Every
+  manual trade, alert button buy and AI copy trade is capped by it
+  or by the stricter checks around it, exactly as on testnet.
+- SLIPPAGE_BPS stays 100 (1 percent) on both networks.
+- The AI daily loss limit has no network condition in its code: a
+  copy wallet that loses its configured daily limit pauses until
+  midnight UTC on mainnet exactly as on testnet.
+- PnL cards follow the network: the pill reads NEAR on mainnet and
+  NEAR TESTNET on testnet, and the caption matches. Samples were
+  re-rendered on both settings on 2026-11-07 and checked by eye.
+
+### Runbook: switching Velocity to mainnet
+
+1. Register velocitybot.near from your mainnet wallet (about 0.1
+   NEAR). This is the project account: fee wallet identity and named
+   wallet creator in one. Save its seed phrase somewhere safe, never
+   in this repo or in chat.
+2. Create a SEPARATE mainnet Telegram bot in BotFather and use its
+   token. Testnet users and data must never mix with real money, and
+   a second bot is what keeps them apart.
+3. Fill the mainnet env block from .env.example into a fresh .env:
+   NEAR_NETWORK=mainnet, the mainnet RPC list, REF_EXCHANGE_ID,
+   DCL_EXCHANGE_ID, WNEAR_ID, the two stablecoin ids (or delete those
+   two lines and take the verified defaults), MAX_TRADE_NEAR=5, and
+   DATA_DIR pointing at a new folder (./data-mainnet). Generate a
+   fresh MASTER_KEY for mainnet and keep the testnet one for testnet.
+4. Fee wallet: set FEE_ACCOUNT_ID=velocitybot.near and encrypt its
+   key with `npm run smoke -- --encrypt-key "ed25519:..."`, pasting
+   the output into FEE_ACCOUNT_SECRET_ENC. (An implicit fee wallet
+   from `npm run make-fee-wallet` also works.) Fund it small: it only
+   pays referral bonuses out.
+5. Creator wallet: set CREATOR_ACCOUNT_ID=velocitybot.near and put
+   its encrypted key in CREATOR_SECRET_ENC the same way, so user
+   names are created by the project account itself. Fund it for the
+   names you expect: each creation attaches 0.01 NEAR that lands in
+   the user's new account.
+6. Run `npm run smoke`. On mainnet config it must print the mainnet
+   RPC list, a live block height, 9014 simple pools, thousands of
+   DCL pools, and two mainnet quotes (wNEAR to USDC and wNEAR to
+   USDT) before you go any further.
+7. Start the bot (`npm run dev`), /start it yourself, and fund your
+   own bot wallet with a small amount.
+8. Make a first tiny trade yourself: buy 0.1 NEAR of a liquid token
+   (USDC or USDT exercise both route kinds between them), then sell
+   it back. Check both transaction lists. Only then open the bot up,
+   and consider raising MAX_TRADE_NEAR deliberately rather than by
+   default.
+
+Custody does not change on mainnet: per user hot wallets with keys
+encrypted under MASTER_KEY, the Forge pattern, stated in the security
+notes below. The session key policy vault remains an optional
+hardening the owner has not chosen; it is not a setting in this bot.
+
+### What only a funded mainnet trade can prove
+
+Read only verification stops at the transaction boundary. Still
+unproven until the first real trades land:
+
+- A landed DCL swap by this bot (quote, message and refund behaviour
+  are trace verified; execution by Velocity itself is not).
+- A mainnet named wallet creation and sweep (the registrar contract
+  evidence is strong and the flow is byte for byte the testnet one,
+  but no .near name has been created by this bot yet).
+- Fee capture and a referral payout moving on mainnet.
+- The per user experience of the wider mainnet pool scan: the first
+  quote after boot pays one full scan (about ten seconds in the
+  smoke run), then the one minute cache carries the rest.
+
+## Security notes
 
 - Custody is per user funded hot wallets, the pattern Forge runs on:
   wallet keys are held encrypted with a master key from the
@@ -373,15 +539,19 @@ on the old address, which the sweep report states openly.
 
 ## Tests
 
-`npm test` runs the unit suite, 43 tests: referral fee math (discount
+`npm test` runs the unit suite, 73 tests: referral fee math (discount
 stops at trade 10, referrer credit continues for life, AI trades
 excluded), PnL tier selection and average cost basis, raw amount
 conversion, slippage math, the instant swap message format, DCL pool
 id and swap message building, DCL route finding (best fee tier, two
 hop chaining through wNEAR, zero liquidity pools skipped), best
 route selection across simple and DCL pools, RPC endpoint parsing and
-failover, and the named wallet rules (username sanitizing edge cases,
-NEAR amount parsing, creator configuration defaults). `npm run typecheck` must
+failover, the named wallet rules (username sanitizing edge cases,
+NEAR amount parsing, creator configuration defaults), and the
+mainnet readiness rules (per network contract selection, scan bounds
+and per trade cap defaults, the TRADING_ENABLED switch refusing buys
+and sells while paused, and the PnL network pill and caption wording
+on both networks). `npm run typecheck` must
 be clean. `npm run render-cards` writes one sample card per tier into
 card-samples.
 

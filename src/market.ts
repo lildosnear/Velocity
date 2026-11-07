@@ -2,7 +2,6 @@ import { config, getPayCurrency, payCurrencyTokenId } from "./config";
 import { decryptPrivateKey, type EncryptedKey } from "./crypto";
 import { store, type TradedToken, type UserRecord } from "./store";
 import {
-  ensureContractStorage,
   ensureFtStorage,
   getFtMetadata,
   readFtBalanceRaw,
@@ -199,9 +198,34 @@ async function exchangeDeposit(creds: WalletCreds, tokenId: string): Promise<big
 }
 
 /**
+ * The operator's trading switch (TRADING_ENABLED). Every execution
+ * path funnels through swapBuy and swapSell below (manual commands,
+ * trader alert buttons and the AI copy engine alike), so this one
+ * check pauses all trading while balances, watch lists and info
+ * commands keep working.
+ */
+export function assertTradingEnabled(): void {
+  if (!config.tradingEnabled) {
+    throw new Error("Trading is paused right now. Balances, watch lists and info commands still work.");
+  }
+}
+
+/**
  * Execute a quoted route. DCL routes are one ft_transfer_call on the
  * input token to the DCL exchange with the Swap message and the
  * slippage floor applied to the quoted output.
+ *
+ * No storage deposit is made on the DCL exchange before a swap, for a
+ * verified reason: a live mainnet trace on 2026-11-07 (transaction
+ * EcQntbawww1C3sxzme3PPPkibTzn3V2p4CboXJMjCFry) shows a swapper whose
+ * storage_balance_of on dclv2.ref-labs.near is null completing a swap
+ * and receiving the output directly, with the unused part of the input
+ * refunded automatically by the token contract's resolve transfer.
+ * The DCL exchange only needs a registered internal account (bounds
+ * minimum 0.5 NEAR) for its other features, which aggregators use;
+ * plain swaps do not. An earlier version of this code deposited the
+ * bounds minimum before a first DCL swap, which on mainnet would
+ * have taken 0.5 NEAR out of a user wallet for no reason.
  *
  * Simple routes use the deposit, swap, withdraw flow on the Ref
  * exchange, for a verified reason: the live testnet exchange rejects
@@ -220,10 +244,6 @@ async function executeRoutedSwap(
   referralId?: string,
 ): Promise<string[]> {
   if (route.kind === "dcl") {
-    // The DCL exchange keeps an internal account per user behind a
-    // storage deposit (0.02 NEAR is the deposit launchpads use when the
-    // contract does not publish bounds).
-    await ensureContractStorage(creds, config.dclExchangeId, 2n * 10n ** 22n);
     const tx = await callFunction(creds, inputTokenId, "ft_transfer_call", {
       receiver_id: config.dclExchangeId,
       amount: amountRaw.toString(),
@@ -305,6 +325,7 @@ export async function swapBuy(
   payCurrencyId: string,
   feeBps: number,
 ): Promise<SwapResult> {
+  assertTradingEnabled();
   const currency = getPayCurrency(payCurrencyId);
   const payTokenId = payCurrencyTokenId(payCurrencyId);
   if (token.id === payTokenId && currency.kind !== "native") {
@@ -391,6 +412,7 @@ export async function swapSell(
   payCurrencyId: string,
   feeBps: number,
 ): Promise<SwapResult> {
+  assertTradingEnabled();
   const currency = getPayCurrency(payCurrencyId);
   const payTokenId = payCurrencyTokenId(payCurrencyId);
   if (token.id === payTokenId && currency.kind !== "native") {
@@ -474,6 +496,7 @@ export async function executeBuy(
   payAmount: number,
   payCurrencyId: string,
 ): Promise<SwapResult> {
+  assertTradingEnabled();
   const token = await resolveToken(tokenRef);
   if (!(payAmount > 0)) throw new Error("Amount must be positive.");
   const currency = getPayCurrency(payCurrencyId);
@@ -503,6 +526,7 @@ export async function executeSell(
   tokenAmount: number,
   payCurrencyId: string,
 ): Promise<SwapResult> {
+  assertTradingEnabled();
   const token = await resolveToken(tokenRef);
   if (!(tokenAmount > 0)) throw new Error("Amount must be positive.");
   const currency = getPayCurrency(payCurrencyId);

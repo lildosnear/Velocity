@@ -1,4 +1,4 @@
-import { config, DEFAULT_RPC_URLS } from "./config";
+import { config, DEFAULT_RPC_URLS, payCurrencyTokenId } from "./config";
 import { encryptPrivateKey } from "./crypto";
 import {
   accountExists,
@@ -8,7 +8,7 @@ import {
   readNearBalance,
   rpcBlockHeight,
 } from "./near";
-import { scanPools } from "./ref";
+import { findRoute, scanPools } from "./ref";
 import { scanDclPools } from "./dcl";
 
 /**
@@ -30,28 +30,50 @@ async function main() {
   }
 
   console.log(`Network: ${config.network}  RPC endpoints (failover order): ${config.nearRpcUrls.join(", ")}`);
+  console.log(
+    `Config: trading ${config.tradingEnabled ? "enabled" : "PAUSED"}, max trade ${config.maxTradeNear} NEAR, ` +
+      `registrar ${config.registrarId}, name suffix ${config.nameSuffix}, USDC ${payCurrencyTokenId("USDC")}, USDT ${payCurrencyTokenId("USDT")}`,
+  );
   const height = await rpcBlockHeight();
   console.log("RPC ok. Block height:", height);
 
   const wnearMeta = await getFtMetadata(config.wnearId);
   console.log(`wNEAR (${config.wnearId}) metadata:`, wnearMeta ? `${wnearMeta.symbol}, ${wnearMeta.decimals} decimals` : "NOT FOUND");
 
-  const pools = await scanPools(200);
-  console.log(`Ref exchange ${config.refExchangeId}: scanned ${pools.length} simple pools (bounded scan).`);
+  const pools = await scanPools();
+  console.log(`Ref exchange ${config.refExchangeId}: scanned ${pools.length} simple pools (scan bound ${config.simplePoolScanLimit}).`);
   const wnearPools = pools.filter((p) => p.tokenIds.includes(config.wnearId));
   console.log(`Pools touching wNEAR in that scan: ${wnearPools.length}`);
   for (const p of wnearPools.slice(0, 5)) {
     console.log(`  pool ${p.id}: ${p.tokenIds.join(" / ")}`);
   }
 
-  const dclPools = await scanDclPools(500);
-  console.log(`DCL exchange ${config.dclExchangeId}: scanned ${dclPools.length} DCL pools (bounded scan).`);
+  const dclPools = await scanDclPools();
+  console.log(`DCL exchange ${config.dclExchangeId}: scanned ${dclPools.length} DCL pools (scan bound ${config.dclPoolScanLimit}).`);
   if (dclPools.length === 0) {
     console.log("  No DCL pools found on this network. On testnet that is expected today: no DCL contract is deployed there.");
   } else {
     const liquid = dclPools.filter((p) => p.liquidity > 0n && (p.tokenX === config.wnearId || p.tokenY === config.wnearId));
     console.log(`  DCL pools with wNEAR and liquidity in that scan: ${liquid.length}`);
     for (const p of liquid.slice(0, 5)) console.log(`  ${p.poolId} liquidity ${p.liquidity.toString()}`);
+  }
+
+  if (config.network === "mainnet") {
+    // Mainnet mode: quote through the bot's own route finder on this
+    // network's contracts. Read only, no signing. This proves the full
+    // mainnet read path (scans plus simple and DCL quoting plus best
+    // route selection) the way a live trade would use it.
+    for (const currencyId of ["USDC", "USDT"]) {
+      try {
+        const tokenId = payCurrencyTokenId(currencyId);
+        const route = await findRoute(config.wnearId, tokenId, 10n ** 23n);
+        console.log(
+          `Mainnet quote: 0.1 wNEAR -> ${route.amountOutRaw.toString()} raw ${currencyId} via ${route.kind} route (${route.description}).`,
+        );
+      } catch (err: any) {
+        console.log(`Mainnet ${currencyId} quote failed:`, err?.message ?? err);
+      }
+    }
   }
 
   if (config.network === "testnet") {

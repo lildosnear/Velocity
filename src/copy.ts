@@ -74,6 +74,7 @@ function checkDailyLimit(user: UserRecord, ai: AiConfig): boolean {
 
 /** Trader bought -> AI buys perTradeAmount worth (in the user's pay currency). */
 export async function onTraderBuy(event: WalletTradeEvent): Promise<void> {
+  if (!config.tradingEnabled) return; // trading paused: copy executions stay quiet, alerts still flow
   const user = store.getUser(event.wallet.ownerTelegramId);
   const ai = user && aiActive(user);
   if (!user || !ai) return;
@@ -141,6 +142,7 @@ async function closePosition(
 ): Promise<void> {
   sellAmount = Math.min(sellAmount, pos.amount);
   if (!(sellAmount > 0)) return;
+  if (!config.tradingEnabled) return; // trading paused (also covers stop loss closes)
   const creds = aiCreds(ai);
   const token = { id: pos.tokenId, symbol: pos.symbol, decimals: await tokenDecimals(pos.tokenId) };
   const result = await swapSell(creds, token, sellAmount, pos.payCurrency, config.botFeeBps);
@@ -168,6 +170,7 @@ async function closePosition(
 
 /** Trader sold -> AI sells the SAME FRACTION of its position. */
 export async function onTraderSell(event: WalletTradeEvent): Promise<void> {
+  if (!config.tradingEnabled) return; // trading paused: copy executions stay quiet, alerts still flow
   const user = store.getUser(event.wallet.ownerTelegramId);
   const ai = user && aiActive(user);
   if (!user || !ai) return;
