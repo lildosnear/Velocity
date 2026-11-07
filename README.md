@@ -199,6 +199,10 @@ stays light, and token metadata is fetched lazily the first time a
 discovered token is seen. Holdings reflect the same widened set. One
 limit, stated plainly: a plain transfer looks the same as a trade, so
 a watched trader receiving tokens by transfer still triggers a diff.
+Alerts are aggregated: all of an account's diffs in one poll arrive as
+a single message, sells stated before buys, and when any other token
+moved in the same poll the wNEAR leg is left out of the text, since it
+is the payment plumbing of the trade rather than a trade of its own.
 
 ### AI auto trading
 
