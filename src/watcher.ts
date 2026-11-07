@@ -1,6 +1,6 @@
 import { InlineKeyboard } from "grammy";
 import { config } from "./config";
-import { readFtBalanceRaw } from "./near";
+import { readFtBalanceRaw, rpcBlockHeight } from "./near";
 import {
   type PendingAlert,
   type PendingAlertLeg,
@@ -10,7 +10,8 @@ import {
   type WatchedWallet,
 } from "./store";
 import { newPendingAlertId, store } from "./store";
-import { notify, notifyAlert } from "./notifier";
+import { logError } from "./log";
+import { notify, notifyAlert, type SentMessageRef } from "./notifier";
 import { onTraderBuy, onTraderSell } from "./copy";
 import { watchTokenSet } from "./discovery";
 
@@ -93,6 +94,53 @@ export async function getHoldings(accountId: string): Promise<Holding[]> {
 
 let last = new Map<string, Map<string, bigint>>(); // watched id -> token id -> raw
 let initializedWallets = new Set<string>();
+
+/**
+ * The in memory snapshots above are a cache of the persisted watcher
+ * progress (see WatchProgress in store.ts). On a cold start the first
+ * tick for a wallet hydrates its snapshot from the store, so a bot
+ * restart or crash resumes diffing where the last completed tick left
+ * off: moves handled before the restart are never re-alerted or
+ * re-copied, and moves that happened while the bot was down are
+ * picked up by the first tick back. Only a wallet with no persisted
+ * progress at all takes the baseline snapshot (no alerts for past
+ * activity), exactly as newly watched wallets always have.
+ */
+function hydrateProgress(watchId: string): Map<string, bigint> | undefined {
+  if (initializedWallets.has(watchId)) return last.get(watchId);
+  const progress = store.getWatchProgress(watchId);
+  if (!progress) return undefined;
+  const map = new Map<string, bigint>();
+  for (const [tokenId, raw] of Object.entries(progress.balances)) {
+    try {
+      const value = BigInt(raw);
+      if (value > 0n) map.set(tokenId, value);
+    } catch {
+      // A malformed entry is skipped, never fatal to the tick.
+    }
+  }
+  last.set(watchId, map);
+  initializedWallets.add(watchId);
+  return map;
+}
+
+function persistProgress(watchId: string, balances: Map<string, bigint>, blockHeight?: number): void {
+  const record: Record<string, string> = {};
+  for (const [tokenId, raw] of balances) {
+    if (raw > 0n) record[tokenId] = raw.toString();
+  }
+  store.saveWatchProgress(watchId, {
+    balances: record,
+    blockHeight,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+/** Test hook: drop the in memory snapshots so the next tick hydrates from the store, as a restart would. */
+export function __resetWatcherState(): void {
+  last = new Map();
+  initializedWallets = new Set();
+}
 
 function short(id: string): string {
   return id.length > 18 ? `${id.slice(0, 10)}...${id.slice(-4)}` : id;
@@ -280,7 +328,36 @@ export function alertBuyAmountNear(user: { ai?: { perTradeAmount?: number } }): 
   return Math.min(base, config.maxTradeNear);
 }
 
-export async function watchTick(): Promise<void> {
+/**
+ * The chain and messaging operations a tick is built from, behind an
+ * interface so tests can drive ticks without a chain. The defaults
+ * are the real ones.
+ */
+export interface WatchTickDeps {
+  tokenSet: () => Promise<TradedToken[]>;
+  scanBalances: (accountId: string, tokens: TradedToken[]) => Promise<Map<string, bigint>>;
+  notifyAlertFn: (
+    telegramId: number,
+    text: string,
+    keyboard: InlineKeyboard,
+  ) => Promise<SentMessageRef | undefined>;
+  notifyFn: (telegramId: number, text: string) => Promise<void>;
+  onBuy: (event: WalletTradeEvent) => Promise<void>;
+  onSell: (event: WalletTradeEvent) => Promise<void>;
+  blockHeight: () => Promise<number>;
+}
+
+const defaultWatchTickDeps: WatchTickDeps = {
+  tokenSet: watchTokenSet,
+  scanBalances: scanWalletBalances,
+  notifyAlertFn: notifyAlert,
+  notifyFn: notify,
+  onBuy: onTraderBuy,
+  onSell: onTraderSell,
+  blockHeight: rpcBlockHeight,
+};
+
+export async function watchTick(deps: WatchTickDeps = defaultWatchTickDeps): Promise<void> {
   const watched = store.allWatched();
   if (watched.length === 0) return;
 
@@ -292,99 +369,156 @@ export async function watchTick(): Promise<void> {
     list.push(w);
     byAccount.set(key, list);
   }
-  const tokens = await watchTokenSet();
+  const tokens = await deps.tokenSet();
   const registry = new Map(tokens.map((t) => [t.id, t]));
+  const height = await deps.blockHeight().catch(() => undefined);
 
   for (const [accountId, watchers] of byAccount) {
     let curr: Map<string, bigint>;
     try {
-      curr = await scanWalletBalances(accountId, tokens);
-    } catch {
+      curr = await deps.scanBalances(accountId, tokens);
+    } catch (err: any) {
+      // One bad account never poisons the tick for the others.
+      logError("watcher", `balance scan failed for ${accountId}; skipping it this tick`, err);
       continue;
     }
 
     for (const w of watchers) {
-      if (!initializedWallets.has(w.id)) {
-        last.set(w.id, curr);
-        initializedWallets.add(w.id);
-        continue; // baseline snapshot, no alerts for past activity
+      try {
+        await processWatcher(w, curr, registry, height, deps);
+      } catch (err: any) {
+        logError("watcher", `tick failed for watched ${w.accountId} (owner ${w.ownerTelegramId}); continuing with the others`, err);
       }
-      const prev = last.get(w.id) ?? new Map<string, bigint>();
-      const tokenIds = new Set<string>([...prev.keys(), ...curr.keys()]);
-
-      // Collect every diff for this watcher first. The user gets ONE
-      // composed alert per tick, while the copy engine below still
-      // consumes the diffs one by one, exactly as before.
-      const events: WalletTradeEvent[] = [];
-      for (const tokenId of tokenIds) {
-        const before = prev.get(tokenId) ?? 0n;
-        const after = curr.get(tokenId) ?? 0n;
-        if (after === before) continue;
-        const token = registry.get(tokenId);
-        if (!token) continue;
-
-        const toTokens = (raw: bigint) => Number(raw) / 10 ** token.decimals;
-        const side = after > before ? "buy" : "sell";
-        events.push({
-          wallet: w,
-          token,
-          side,
-          amountTokens: Math.abs(toTokens(after > before ? after - before : before - after)),
-          beforeTokens: toTokens(before),
-          afterTokens: toTokens(after),
-        });
-      }
-
-      if (events.length > 0) {
-        const text = composeTraderAlert(short(w.accountId), events, config.wnearId);
-        if (text) {
-          const fullText = text + (w.mode === "auto" ? "\nAuto copy is ON, working on it..." : "");
-          // Every watcher gets their own pending alert record and their
-          // own buttons; the record is how a later tap finds the tokens
-          // and the message to edit, since callback data carries only
-          // the short record id.
-          const legs = alertLegs(events, config.wnearId);
-          const alert: PendingAlert = {
-            id: newPendingAlertId(),
-            telegramId: w.ownerTelegramId,
-            traderAccountId: w.accountId,
-            tokens: alertBoughtTokens(events, config.wnearId),
-            legs,
-            text: fullText,
-            createdAt: new Date().toISOString(),
-          };
-          store.savePendingAlert(alert);
-          const sent = await notifyAlert(
-            w.ownerTelegramId,
-            fullText,
-            buildAlertKeyboard(alert.id, legs),
-          );
-          if (sent) {
-            alert.chatId = sent.chatId;
-            alert.messageId = sent.messageId;
-            store.savePendingAlert(alert);
-          }
-        }
-
-        if (w.mode === "auto") {
-          for (const event of events) {
-            try {
-              if (event.side === "buy") await onTraderBuy(event);
-              else await onTraderSell(event);
-            } catch (err: any) {
-              await notify(w.ownerTelegramId, `Auto copy failed: ${err?.message ?? err}`);
-            }
-          }
-        }
-      }
-      last.set(w.id, curr);
     }
   }
 }
 
+/** Diff one watched wallet against its snapshot, then alert and copy. Isolated per watcher by the caller. */
+async function processWatcher(
+  w: WatchedWallet,
+  curr: Map<string, bigint>,
+  registry: Map<string, TradedToken>,
+  height: number | undefined,
+  deps: WatchTickDeps,
+): Promise<void> {
+  const prev = hydrateProgress(w.id);
+  if (!prev) {
+    // Baseline snapshot, no alerts for past activity. Persisted, so
+    // the baseline survives restarts like any other progress.
+    last.set(w.id, curr);
+    initializedWallets.add(w.id);
+    persistProgress(w.id, curr, height);
+    return;
+  }
+  const tokenIds = new Set<string>([...prev.keys(), ...curr.keys()]);
+
+  // Collect every diff for this watcher first. The user gets ONE
+  // composed alert per tick, while the copy engine below still
+  // consumes the diffs one by one, exactly as before.
+  const events: WalletTradeEvent[] = [];
+  for (const tokenId of tokenIds) {
+    const before = prev.get(tokenId) ?? 0n;
+    const after = curr.get(tokenId) ?? 0n;
+    if (after === before) continue;
+    const token = registry.get(tokenId);
+    if (!token) continue;
+
+    const toTokens = (raw: bigint) => Number(raw) / 10 ** token.decimals;
+    const side = after > before ? "buy" : "sell";
+    events.push({
+      wallet: w,
+      token,
+      side,
+      amountTokens: Math.abs(toTokens(after > before ? after - before : before - after)),
+      beforeTokens: toTokens(before),
+      afterTokens: toTokens(after),
+    });
+  }
+
+  if (events.length === 0) {
+    last.set(w.id, curr);
+    return;
+  }
+
+  // Persist the new snapshot BEFORE dispatching alerts and copies.
+  // If the process dies mid dispatch, the restart resumes from this
+  // snapshot and the move is never alerted or copied twice. The cost
+  // of a badly timed crash is at most one lost alert; the alternative
+  // (persist after dispatch) can double copy a trade, which spends
+  // real money twice.
+  last.set(w.id, curr);
+  persistProgress(w.id, curr, height);
+
+  const text = composeTraderAlert(short(w.accountId), events, config.wnearId);
+  if (text) {
+    const fullText = text + (w.mode === "auto" ? "\nAuto copy is ON, working on it..." : "");
+    // Every watcher gets their own pending alert record and their
+    // own buttons; the record is how a later tap finds the tokens
+    // and the message to edit, since callback data carries only
+    // the short record id.
+    const legs = alertLegs(events, config.wnearId);
+    const alert: PendingAlert = {
+      id: newPendingAlertId(),
+      telegramId: w.ownerTelegramId,
+      traderAccountId: w.accountId,
+      tokens: alertBoughtTokens(events, config.wnearId),
+      legs,
+      text: fullText,
+      createdAt: new Date().toISOString(),
+    };
+    store.savePendingAlert(alert);
+    const sent = await deps.notifyAlertFn(
+      w.ownerTelegramId,
+      fullText,
+      buildAlertKeyboard(alert.id, legs),
+    );
+    if (sent) {
+      alert.chatId = sent.chatId;
+      alert.messageId = sent.messageId;
+      store.savePendingAlert(alert);
+    }
+  }
+
+  if (w.mode === "auto") {
+    for (const event of events) {
+      try {
+        if (event.side === "buy") await deps.onBuy(event);
+        else await deps.onSell(event);
+      } catch (err: any) {
+        logError(
+          "copy",
+          `user=${w.ownerTelegramId} auto copy ${event.side} ${event.token.symbol} from ${w.accountId} failed`,
+          err,
+        );
+        await deps.notifyFn(w.ownerTelegramId, `Auto copy failed: ${err?.message ?? err}`);
+      }
+    }
+  }
+}
+
+/**
+ * The watcher loop: a self scheduling timer (so ticks never overlap),
+ * first tick five seconds after boot for the baseline snapshot. A
+ * tick that throws is logged to console and file, and the next tick
+ * waits with a modest backoff (doubling, capped at eight times the
+ * poll interval) instead of hammering a struggling network; a clean
+ * tick resets the backoff.
+ */
 export function startWatcher(onTick: () => Promise<void>): void {
-  const secs = config.watchPollSecs;
-  const run = () => onTick().catch((err) => console.error("watcher tick:", err?.message ?? err));
-  setInterval(run, secs * 1000);
+  const baseMs = config.watchPollSecs * 1000;
+  let failures = 0;
+  const run = async (): Promise<void> => {
+    try {
+      await onTick();
+      failures = 0;
+      setTimeout(run, baseMs);
+    } catch (err: any) {
+      failures += 1;
+      const delayMs = Math.min(baseMs * 2 ** failures, baseMs * 8);
+      console.error("watcher tick:", err?.message ?? err);
+      logError("watcher", `tick failed (${failures} in a row); next tick in ${Math.round(delayMs / 1000)}s`, err);
+      setTimeout(run, delayMs);
+    }
+  };
   setTimeout(run, 5000); // first tick takes the baseline snapshot
 }

@@ -17,6 +17,7 @@ import {
   type WalletCreds,
 } from "./near";
 import { watchTokenSet } from "./discovery";
+import { isChainReady } from "./readiness";
 import { applySlippage, findRoute, type PoolKind, type RouteQuote } from "./ref";
 import { dclSwapMsg } from "./dcl";
 import { getNearValueOfFt, getTokenPriceNear, tokenDecimals } from "./prices";
@@ -265,6 +266,21 @@ export async function pollForArrival(
 export function assertTradingEnabled(): void {
   if (!config.tradingEnabled) {
     throw new Error("Trading is paused right now. Balances, watch lists and info commands still work.");
+  }
+}
+
+/**
+ * Chain readiness gate, checked beside the trading switch. While the
+ * boot probe and the RPC layer agree the chain cannot be reached,
+ * trades refuse with these plain words instead of surfacing raw RPC
+ * errors. The flag corrects itself from real traffic (see
+ * readiness.ts), so a recovered network unblocks trading on its own.
+ */
+export function assertChainReady(): void {
+  if (!isChainReady()) {
+    throw new Error(
+      "The NEAR network is unreachable right now, so trades are on hold. Nothing was signed and nothing was spent. Try again shortly.",
+    );
   }
 }
 
@@ -572,6 +588,7 @@ export async function swapBuy(
   feeBps: number,
 ): Promise<SwapResult> {
   assertTradingEnabled();
+  assertChainReady();
   const currency = getPayCurrency(payCurrencyId);
   const payTokenId = payCurrencyTokenId(payCurrencyId);
   if (token.id === payTokenId && currency.kind !== "native") {
@@ -664,6 +681,7 @@ export async function swapSell(
   feeBps: number,
 ): Promise<SwapResult> {
   assertTradingEnabled();
+  assertChainReady();
   const currency = getPayCurrency(payCurrencyId);
   const payTokenId = payCurrencyTokenId(payCurrencyId);
   if (token.id === payTokenId && currency.kind !== "native") {

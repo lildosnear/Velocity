@@ -44,6 +44,7 @@ test("testnet config keeps the proven testnet contract set", () => {
   assert.equal(c.payCurrencies.find((p) => p.id === "USDT")?.contractId, "usdt.fakes.testnet");
   assert.deepEqual(c.nearRpcUrls, [
     "https://rpc.testnet.fastnear.com",
+    "https://test.rpc.fastnear.com",
     "https://near-testnet.drpc.org",
     "https://rpc.testnet.near.org",
   ]);

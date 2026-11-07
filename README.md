@@ -69,13 +69,15 @@ on the NEAR value of each trade, whichever pool kind fills it.
      `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
    - `NEAR_RPC_URL` comes prefilled with a comma separated list of RPC
      endpoints; leave it as is. When an endpoint rate limits (HTTP 429,
-     or the legacy endpoint's -429 deprecation error) or drops a call,
-     the bot retries the same call against the next endpoint in the
-     list, for reads and signed transactions alike, instead of failing
-     the command. Defaults: testnet FastNear, dRPC, then the legacy
-     NEAR endpoint; mainnet uses the matching mainnet set. Pool scans
-     are also cached for a minute, so quoting does not rescan the
-     exchange on every trade.
+     or the legacy endpoint's -429 deprecation error), times out or
+     drops a call, the bot abandons that endpoint and retries against
+     the next one in the list, for reads and signed transactions
+     alike, instead of failing the command. Endpoints that keep
+     failing are cooled down for a few minutes and skipped while the
+     others are healthy. Defaults: testnet FastNear (both of its
+     endpoints), dRPC, then the legacy NEAR endpoint; mainnet uses
+     the matching mainnet set. Pool scans are also cached for a
+     minute, so quoting does not rescan the exchange on every trade.
 5. Create the fee wallet: `npm run make-fee-wallet`. It prints
    `FEE_ACCOUNT_ID` and `FEE_ACCOUNT_SECRET_ENC` ready to paste into
    `.env`, then fund that account with a little NEAR (it pays referral
@@ -552,6 +554,62 @@ unproven until the first real trades land:
   quote after boot pays one full scan (about ten seconds in the
   smoke run), then the one minute cache carries the rest.
 
+## Running it well
+
+Velocity is built to keep running through the conditions a home PC
+and public RPC endpoints actually serve: rate limits, deprecations,
+lagging nodes, power cuts, double taps. What an operator needs to
+know:
+
+- **One operation at a time per user.** Buys, sells, alert button
+  trades, withdraws, recoveries and AI copy executions for the same
+  user never run concurrently. A second one while the first is still
+  working is answered plainly ("Still working on your last request,
+  give it a moment.") and never becomes a duplicate trade. Different
+  users never block each other, and watching never blocks at all.
+- **Logs.** Alongside the console, the bot appends structured lines
+  (time, level, scope, message) to `logs/velocity.log` in the project
+  folder, rotating at about 5 MB and keeping three files. Trade
+  failures, watcher tick failures, RPC rotations and store events
+  land there with the user id, the action and the transaction ids
+  involved, so a pasted tail of the log is enough to diagnose most
+  problems after the fact. Secrets and encrypted keys are never
+  logged.
+- **Doctor.** `npm run doctor` prints a plain PASS, FAIL or SKIP
+  line per check: env completeness (names only, never values), each
+  configured RPC endpoint answering with its latency, Ref and DCL
+  reachability and pool counts, store integrity and user count, fee
+  and creator wallet existence on chain, and a master key decryption
+  sanity check. Run it and paste the output whenever anything feels
+  off; the exit code is 1 when any check fails.
+- **Store backups.** Every save of `data/store.json` is atomic (temp
+  file, fsync, rename), so a power cut mid save leaves the old file
+  or the new one, never a torn one. The previous store is copied to
+  a timestamped `store.backup-*.json` in the same folder and the
+  last five are kept. If the main store is ever missing or
+  unreadable, the bot loads the newest readable backup and logs the
+  fact loudly; if nothing readable remains it refuses to start
+  rather than starting empty and orphaning every wallet. At startup
+  the bot also verifies the master key against a stored wallet: a
+  changed or lost MASTER_KEY is a clear stopped bot, not a bot whose
+  trades all fail.
+- **The readiness line.** Boot prints one line like:
+  `Velocity ready: NEAR testnet, block 276696750, 196 Ref pools seen, trading enabled, fee wallet not set (fees skipped).`
+  It states the network, the chain height the RPC can see, how many
+  pools the exchange scan found, whether trading is enabled or
+  paused (TRADING_ENABLED), and whether the fee wallet is set. If
+  the RPC is unreachable at boot the bot still starts, keeps
+  retrying in the background, and trade commands answer plainly that
+  the network is unreachable until a probe succeeds; when every
+  endpoint fails a signed operation, the user is told the network
+  could not be reached and that nothing was signed or spent, never a
+  raw library error.
+- **Watcher memory.** The watcher's progress (the balance snapshot
+  each watched wallet was last diffed against, with its block
+  height) is persisted in the store. A restart or crash never
+  re-alerts or re-copies a move that was already handled, and moves
+  made while the bot was down are picked up by the first tick back.
+
 ## Security notes
 
 - Custody is per user funded hot wallets, the pattern Forge runs on:
@@ -573,7 +631,7 @@ unproven until the first real trades land:
 
 ## Tests
 
-`npm test` runs the unit suite, 85 tests: referral fee math (discount
+`npm test` runs the unit suite, 120 tests: referral fee math (discount
 stops at trade 10, referrer credit continues for life, AI trades
 excluded), PnL tier selection and average cost basis, raw amount
 conversion, slippage math, the instant swap message format, DCL pool
@@ -585,11 +643,20 @@ created ids always top level, NEAR amount parsing, creator
 configuration defaults), the name prompt lifecycle at handler level
 (prompt set at /start and by /name only when configured, a plain
 reply claims, a command or "skip" clears it, a taken or unclean name
-keeps it open and claims nothing), and the
+keeps it open and claims nothing), the
 mainnet readiness rules (per network contract selection, scan bounds
 and per trade cap defaults, the TRADING_ENABLED switch refusing buys
 and sells while paused, and the PnL network pill and caption wording
-on both networks). `npm run typecheck` must
+on both networks), and the reliability rules (the signed call attempt
+loop under failure injection: rotation after a 429 and after a
+timeout, recovery of a broadcast that landed despite its send error,
+nonce refetch on InvalidNonce, no rotation on deterministic errors,
+the plain nothing was signed message when every endpoint is down;
+the store's atomic saves, rotating backups, fallback loading and
+master key verification; the per user operation lock refusing
+concurrent duplicates; and watcher progress surviving a restart
+without re-alerting or re-copying, with one bad account isolated
+from the rest of the tick). `npm run typecheck` must
 be clean. `npm run render-cards` writes one sample card per tier into
 card-samples.
 

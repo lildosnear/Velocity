@@ -37,6 +37,8 @@ import {
   type NamePromptDeps,
 } from "./names";
 import { aiActive } from "./copy";
+import { releaseUserLock, tryAcquireUserLock, UserBusyError, withUserLock } from "./locks";
+import { logError } from "./log";
 import { alertBuyAmountNear, alertSellAmountRaw, getHoldings } from "./watcher";
 import { pnlCaption, realizedCardInput, renderPnlCard, unrealizedCardInput } from "./share/pnl";
 
@@ -384,28 +386,36 @@ export function registerCommands(
     const user = await getOrCreateUser(ctx);
     const wait = await ctx.reply("Checking the exchange for parked funds...");
     try {
-      const extras = await parkedDeps.extraCandidates().catch(() => []);
-      const candidates = await recoverCandidates(user, extras);
-      const lines: string[] = [];
-      const main = await recoverParkedFunds(credsOf(user), candidates, parkedDeps);
-      lines.push(...recoverLines(main));
-      // The AI wallet trades through the same exchange flow, so it can
-      // park funds the same way. Recover it too when it exists and
-      // anything is found there (or failed), labelled so the user
-      // knows which wallet the money landed in.
-      if (user.ai) {
-        const aiCreds = { accountId: user.ai.accountId, secret: decryptPrivateKey(user.ai.encSecret) };
-        const aiOutcome = await recoverParkedFunds(aiCreds, candidates, parkedDeps).catch(() => undefined);
-        if (aiOutcome && (aiOutcome.parked.length > 0 || aiOutcome.failures.length > 0)) {
-          lines.push(...recoverLines(aiOutcome, "AI wallet"));
+      const lines = await withUserLock(user.telegramId, async () => {
+        const extras = await parkedDeps.extraCandidates().catch(() => []);
+        const candidates = await recoverCandidates(user, extras);
+        const out: string[] = [];
+        const main = await recoverParkedFunds(credsOf(user), candidates, parkedDeps);
+        out.push(...recoverLines(main));
+        // The AI wallet trades through the same exchange flow, so it can
+        // park funds the same way. Recover it too when it exists and
+        // anything is found there (or failed), labelled so the user
+        // knows which wallet the money landed in.
+        if (user.ai) {
+          const aiCreds = { accountId: user.ai.accountId, secret: decryptPrivateKey(user.ai.encSecret) };
+          const aiOutcome = await recoverParkedFunds(aiCreds, candidates, parkedDeps).catch(() => undefined);
+          if (aiOutcome && (aiOutcome.parked.length > 0 || aiOutcome.failures.length > 0)) {
+            out.push(...recoverLines(aiOutcome, "AI wallet"));
+          }
         }
-      }
+        return out;
+      });
       if (lines.length === 0) {
         await ctx.reply("Nothing is parked inside the exchange. Everything you own is already in your wallet.");
       } else {
         await ctx.reply(lines.join("\n"));
       }
     } catch (err: any) {
+      if (err instanceof UserBusyError) {
+        await ctx.reply(err.message);
+        return;
+      }
+      logError("trade", `user=${user.telegramId} recover failed`, err);
       await ctx.reply(`Recover failed: ${err?.message ?? err}`);
     } finally {
       await ctx.api.deleteMessage(wait.chat.id, wait.message_id).catch(() => {});
@@ -445,12 +455,19 @@ export function registerCommands(
     }
     const msg = await ctx.reply(`Quoting ${amountStr} ${currencyId} of ${tokenRef}...`);
     try {
-      const result = await executeBuy(user, tokenRef, Number(amountStr), currencyId);
+      const result = await withUserLock(user.telegramId, () =>
+        executeBuy(user, tokenRef, Number(amountStr), currencyId),
+      );
       await ctx.reply(
         `Bought ${fmt(result.tokenAmount, 2)} ${result.symbol} for ${fmt(result.payAmount, 4)} ${result.payCurrency} ` +
           `at ${fmt(result.priceNear, 6)} NEAR each.\nTx: ${result.txids.join(", ")}`,
       );
     } catch (err: any) {
+      if (err instanceof UserBusyError) {
+        await ctx.reply(err.message);
+        return;
+      }
+      logError("trade", `user=${user.telegramId} buy ${tokenRef} ${amountStr} ${currencyId} failed`, err);
       await ctx.reply(`Buy failed: ${err?.message ?? err}`, { reply_to_message_id: msg.message_id } as any);
     }
   });
@@ -475,7 +492,9 @@ export function registerCommands(
     // knows it from AI positions; manual sells use the chosen currency.
     const msg = await ctx.reply(`Quoting sale of ${amountStr} ${tokenRef}...`);
     try {
-      const result = await executeSell(user, tokenRef, Number(amountStr), currencyId);
+      const result = await withUserLock(user.telegramId, () =>
+        executeSell(user, tokenRef, Number(amountStr), currencyId),
+      );
       const shareKb = new InlineKeyboard().text("📤 Share PnL card", `pnl:${result.symbol}`);
       await ctx.reply(
         `Sold ${fmt(result.tokenAmount, 2)} ${result.symbol} for ${fmt(result.payAmount, 4)} ${result.payCurrency} ` +
@@ -483,6 +502,11 @@ export function registerCommands(
         { reply_markup: shareKb },
       );
     } catch (err: any) {
+      if (err instanceof UserBusyError) {
+        await ctx.reply(err.message);
+        return;
+      }
+      logError("trade", `user=${user.telegramId} sell ${tokenRef} ${amountStr} ${currencyId} failed`, err);
       await ctx.reply(`Sell failed: ${err?.message ?? err}`, { reply_to_message_id: msg.message_id } as any);
     }
   });
@@ -502,9 +526,16 @@ export function registerCommands(
       return;
     }
     try {
-      const txid = await transferNear(credsOf(user), accountId, BigInt(Math.round(amount * 1e24)));
+      const txid = await withUserLock(user.telegramId, () =>
+        transferNear(credsOf(user), accountId, BigInt(Math.round(amount * 1e24))),
+      );
       await ctx.reply(`Withdrew ${fmt(amount)} NEAR to ${accountId}.\nTx: ${txid}`);
     } catch (err: any) {
+      if (err instanceof UserBusyError) {
+        await ctx.reply(err.message);
+        return;
+      }
+      logError("trade", `user=${user.telegramId} withdraw ${amount} NEAR to ${accountId} failed`, err);
       await ctx.reply(`Withdraw failed: ${err?.message ?? err}`);
     }
   });
@@ -592,15 +623,23 @@ export function registerCommands(
           await ctx.reply(`The fee wallet is short (${feeBalance.toFixed(4)} NEAR) for your ${earned.toFixed(8)} NEAR bonus. It stays banked, ask the operator to top the fee wallet up.`);
           return;
         }
-        const txid = await transferNear(
-          { accountId: feeWallet.accountId, secret: feeWallet.secret },
-          user.accountId,
-          BigInt(Math.round(earned * 1e24)),
+        const feeSecret = feeWallet.secret; // narrowed by the guard above; captured for the closure
+        const txid = await withUserLock(me, () =>
+          transferNear(
+            { accountId: feeWallet.accountId, secret: feeSecret },
+            user.accountId,
+            BigInt(Math.round(earned * 1e24)),
+          ),
         );
         user.referralEarnedNear = 0;
         store.saveUser(user);
         await ctx.reply(`Withdrew ${earned.toFixed(8)} NEAR referral bonus.\nTx: ${txid}`);
       } catch (err: any) {
+        if (err instanceof UserBusyError) {
+          await ctx.reply(err.message);
+          return;
+        }
+        logError("trade", `user=${me} referral withdraw ${earned} NEAR failed`, err);
         await ctx.reply(`Withdraw failed: ${err?.message ?? err}`);
       }
       return;
@@ -726,6 +765,12 @@ export function registerCommands(
       await ctx.answerCallbackQuery({ text: "Open the bot with /start first." }).catch(() => {});
       return;
     }
+    // One money operation at a time for this user: a second tap while
+    // a trade is still running is refused, never duplicated.
+    if (!tryAcquireUserLock(user.telegramId)) {
+      await ctx.answerCallbackQuery({ text: new UserBusyError().message }).catch(() => {});
+      return;
+    }
     // Answer now so Telegram does not spin while the swap runs.
     await ctx.answerCallbackQuery({ text: `Buying ${token.symbol}...` }).catch(() => {});
     try {
@@ -737,8 +782,11 @@ export function registerCommands(
         `${alert.text}\nYou bought ${fmt(result.tokenAmount, 2)} ${result.symbol} for ${fmt(result.payAmount, 4)} NEAR.`,
       );
     } catch (err: any) {
+      logError("trade", `user=${user.telegramId} alert buy ${token.symbol} failed`, err);
       // Keyboard stays in place so the user can retry or ignore.
       await ctx.reply(`Alert buy failed: ${err?.message ?? err}`);
+    } finally {
+      releaseUserLock(user.telegramId);
     }
   });
 
@@ -757,42 +805,53 @@ export function registerCommands(
       await ctx.answerCallbackQuery({ text: "Open the bot with /start first." }).catch(() => {});
       return;
     }
-    // The amount is the fraction the trader sold, applied to the
-    // user's CURRENT balance, read live now rather than at alert
-    // time. Work it out before answering the tap, so a user holding
-    // none gets a plain no instead of a trade attempt.
-    let amountRaw: bigint;
-    let decimals: number;
-    try {
-      decimals = await tokenDecimals(leg.id);
-      const balanceRaw = await readFtBalanceRaw(leg.id, user.accountId);
-      amountRaw = alertSellAmountRaw(balanceRaw, leg.sellFraction);
-    } catch (err: any) {
-      await ctx.answerCallbackQuery().catch(() => {});
-      await ctx.reply(`Alert sell failed: ${err?.message ?? err}`);
+    // One money operation at a time for this user, held from the
+    // balance read to the end of the sale: refused taps never trade.
+    if (!tryAcquireUserLock(user.telegramId)) {
+      await ctx.answerCallbackQuery({ text: new UserBusyError().message }).catch(() => {});
       return;
     }
-    if (!(amountRaw > 0n)) {
-      await ctx.answerCallbackQuery({ text: `You hold no ${leg.symbol}.` }).catch(() => {});
-      await ctx.reply(
-        `That alert was the trader selling ${leg.symbol}, but you hold none of it, so there is nothing to sell.`,
-      );
-      return;
-    }
-    // Answer now so Telegram does not spin while the swap runs.
-    await ctx.answerCallbackQuery({ text: `Selling ${leg.symbol}...` }).catch(() => {});
     try {
-      const tokenAmount = Number(amountRaw) / 10 ** decimals;
-      const result = await executeSell(user, leg.id, tokenAmount, user.payCurrency);
-      store.deletePendingAlert(alert.id);
-      await rewriteAlertMessage(
-        ctx,
-        alert,
-        `${alert.text}\nYou sold ${fmt(result.tokenAmount, 2)} ${result.symbol} for ${fmt(result.payAmount, 4)} ${result.payCurrency}.`,
-      );
-    } catch (err: any) {
-      // Keyboard stays in place so the user can retry or ignore.
-      await ctx.reply(`Alert sell failed: ${err?.message ?? err}`);
+      // The amount is the fraction the trader sold, applied to the
+      // user's CURRENT balance, read live now rather than at alert
+      // time. Work it out before answering the tap, so a user holding
+      // none gets a plain no instead of a trade attempt.
+      let amountRaw: bigint;
+      let decimals: number;
+      try {
+        decimals = await tokenDecimals(leg.id);
+        const balanceRaw = await readFtBalanceRaw(leg.id, user.accountId);
+        amountRaw = alertSellAmountRaw(balanceRaw, leg.sellFraction);
+      } catch (err: any) {
+        await ctx.answerCallbackQuery().catch(() => {});
+        await ctx.reply(`Alert sell failed: ${err?.message ?? err}`);
+        return;
+      }
+      if (!(amountRaw > 0n)) {
+        await ctx.answerCallbackQuery({ text: `You hold no ${leg.symbol}.` }).catch(() => {});
+        await ctx.reply(
+          `That alert was the trader selling ${leg.symbol}, but you hold none of it, so there is nothing to sell.`,
+        );
+        return;
+      }
+      // Answer now so Telegram does not spin while the swap runs.
+      await ctx.answerCallbackQuery({ text: `Selling ${leg.symbol}...` }).catch(() => {});
+      try {
+        const tokenAmount = Number(amountRaw) / 10 ** decimals;
+        const result = await executeSell(user, leg.id, tokenAmount, user.payCurrency);
+        store.deletePendingAlert(alert.id);
+        await rewriteAlertMessage(
+          ctx,
+          alert,
+          `${alert.text}\nYou sold ${fmt(result.tokenAmount, 2)} ${result.symbol} for ${fmt(result.payAmount, 4)} ${result.payCurrency}.`,
+        );
+      } catch (err: any) {
+        logError("trade", `user=${user.telegramId} alert sell ${leg.symbol} failed`, err);
+        // Keyboard stays in place so the user can retry or ignore.
+        await ctx.reply(`Alert sell failed: ${err?.message ?? err}`);
+      }
+    } finally {
+      releaseUserLock(user.telegramId);
     }
   });
 

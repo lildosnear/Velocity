@@ -16,6 +16,7 @@ test("rpc url parsing splits a comma separated list, trims and dedupes", () => {
 test("rpc url parsing falls back to network defaults when unset or blank", () => {
   const testnet = parseRpcUrls(undefined, "testnet");
   assert.equal(testnet[0], "https://rpc.testnet.fastnear.com");
+  assert.ok(testnet.includes("https://test.rpc.fastnear.com"));
   assert.ok(testnet.includes("https://near-testnet.drpc.org"));
   assert.ok(testnet.includes("https://rpc.testnet.near.org"));
   assert.deepEqual(parseRpcUrls("  , ,", "testnet"), testnet);

@@ -1,8 +1,21 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  copyFileSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { config } from "./config";
-import type { EncryptedKey } from "./crypto";
+import { decryptPrivateKey, type EncryptedKey } from "./crypto";
+import { logError } from "./log";
 
 /**
  * Store: a single JSON file, same shape as the Forge store.
@@ -11,6 +24,18 @@ import type { EncryptedKey } from "./crypto";
  * Token holdings are read live on chain, so unlike Forge there are no
  * paper balances: the store keeps the list of tokens each user has traded
  * so balances and positions can be enumerated.
+ *
+ * Durability (the 2026-11-07 hardening pass). This file holds every
+ * user's encrypted secret key, so losing it orphans every wallet the
+ * bot ever made. Saves are therefore atomic: the new state is written
+ * to a temp file in the same directory, fsynced, and renamed over the
+ * store, so a crash or a power cut mid save leaves either the old
+ * file or the new one, never a torn half file. Before each replace,
+ * the previous store is copied to a timestamped backup and the last
+ * five are kept. On load, a missing or unparseable main store falls
+ * back to the newest parseable backup and says so loudly; if nothing
+ * parses, loading throws a clear operator error rather than starting
+ * empty and orphaning every wallet.
  */
 
 export interface TradedToken {
@@ -214,33 +239,192 @@ export interface AiConfig {
   dailyPnl: { date: string; realizedNear: number };
 }
 
+/**
+ * The watcher's persisted progress for one watched wallet: the balance
+ * snapshot the last completed tick diffed against, so a restart or a
+ * crash resumes diffing instead of starting over (and can never
+ * re-alert or re-copy a move it already handled). Raw balances are
+ * decimal strings because JSON cannot hold bigints. Bounded by the
+ * watch token set, which is itself capped.
+ */
+export interface WatchProgress {
+  /** token id -> raw balance (decimal string), nonzero balances only */
+  balances: Record<string, string>;
+  /** block height when the snapshot was taken, when the tick could read it */
+  blockHeight?: number;
+  updatedAt: string;
+}
+
 interface StoreShape {
   users: Record<string, UserRecord>;
   trades: TradeRecord[];
   pendingSettlements: PendingSettlement[];
   watched: Record<string, WatchedWallet>;
   pendingAlerts: Record<string, PendingAlert>;
+  watchProgress: Record<string, WatchProgress>;
 }
 
 const storePath = join(config.dataDir, "store.json");
+const BACKUP_PREFIX = "store.backup-";
+const BACKUP_SUFFIX = ".json";
+/** How many timestamped store backups are kept in the data directory. */
+export const STORE_BACKUPS_KEPT = 5;
 
-function load(): StoreShape {
-  if (!existsSync(storePath)) {
-    return { users: {}, trades: [], pendingSettlements: [], watched: {}, pendingAlerts: {} };
-  }
-  const parsed = JSON.parse(readFileSync(storePath, "utf8")) as Partial<StoreShape>;
+function emptyShape(): StoreShape {
+  return { users: {}, trades: [], pendingSettlements: [], watched: {}, pendingAlerts: {}, watchProgress: {} };
+}
+
+function normalizeShape(parsed: Partial<StoreShape>): StoreShape {
   return {
     users: parsed.users ?? {},
     trades: parsed.trades ?? [],
     pendingSettlements: parsed.pendingSettlements ?? [],
     watched: parsed.watched ?? {},
     pendingAlerts: parsed.pendingAlerts ?? {},
+    watchProgress: parsed.watchProgress ?? {},
   };
+}
+
+function readShapeFile(path: string): StoreShape | undefined {
+  try {
+    return normalizeShape(JSON.parse(readFileSync(path, "utf8")) as Partial<StoreShape>);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Backup file paths in the data directory, newest first (the timestamped names sort chronologically). */
+export function listStoreBackups(): string[] {
+  try {
+    return readdirSync(config.dataDir)
+      .filter((f) => f.startsWith(BACKUP_PREFIX) && f.endsWith(BACKUP_SUFFIX))
+      .sort()
+      .reverse()
+      .map((f) => join(config.dataDir, f));
+  } catch {
+    return [];
+  }
+}
+
+let fallbackNoticeLogged = false;
+
+function load(): StoreShape {
+  const mainExists = existsSync(storePath);
+  if (mainExists) {
+    const main = readShapeFile(storePath);
+    if (main) return main;
+  }
+  const backups = listStoreBackups();
+  for (const backup of backups) {
+    const shape = readShapeFile(backup);
+    if (shape) {
+      if (!fallbackNoticeLogged) {
+        fallbackNoticeLogged = true;
+        const msg =
+          `store.json was ${mainExists ? "unreadable" : "missing"}; loaded the newest readable backup ` +
+          `(${basename(backup)}). Anything saved after that backup is rolled back.`;
+        console.error(`STORE WARNING: ${msg}`);
+        logError("store", msg);
+      }
+      return shape;
+    }
+  }
+  if (!mainExists && backups.length === 0) return emptyShape();
+  throw new Error(
+    "Velocity store could not be loaded: store.json is unreadable and no readable backup exists in the data folder. " +
+      "Refusing to start with an empty store, because that would orphan every user's wallet. " +
+      "Restore store.json from a backup copy, then restart.",
+  );
+}
+
+/** Copy the current store to a timestamped backup (only when it still parses) and prune to the newest few. */
+function backupCurrentStore(): void {
+  try {
+    if (!existsSync(storePath)) return;
+    const text = readFileSync(storePath, "utf8");
+    JSON.parse(text); // never back up a file that is already broken
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    copyFileSync(storePath, join(config.dataDir, `${BACKUP_PREFIX}${stamp}${BACKUP_SUFFIX}`));
+    for (const stale of listStoreBackups().slice(STORE_BACKUPS_KEPT)) {
+      try {
+        unlinkSync(stale);
+      } catch {
+        // Pruning is best effort.
+      }
+    }
+  } catch {
+    // A failed backup never blocks the save it precedes.
+  }
 }
 
 function save(shape: StoreShape): void {
   mkdirSync(config.dataDir, { recursive: true });
-  writeFileSync(storePath, JSON.stringify(shape, null, 2), "utf8");
+  backupCurrentStore();
+  // Atomic replace: temp file in the same directory, fsync, rename.
+  // A crash or power cut leaves the old store or the new one, whole.
+  const tmpPath = join(config.dataDir, `store.json.tmp-${process.pid}`);
+  const fd = openSync(tmpPath, "w");
+  try {
+    writeSync(fd, JSON.stringify(shape, null, 2));
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmpPath, storePath);
+}
+
+/**
+ * Store health for the doctor script and the boot checks. Never
+ * throws: a store that cannot be resolved reports parses=false.
+ */
+export interface StoreInspection {
+  path: string;
+  exists: boolean;
+  /** the main store file itself parses */
+  parses: boolean;
+  /** users visible through the normal load path (backup fallback included) */
+  userCount: number;
+  backupCount: number;
+}
+
+export function inspectStore(): StoreInspection {
+  const exists = existsSync(storePath);
+  const parses = exists ? readShapeFile(storePath) !== undefined : false;
+  let userCount = 0;
+  try {
+    userCount = Object.keys(load().users).length;
+  } catch {
+    userCount = 0;
+  }
+  return { path: storePath, exists, parses, userCount, backupCount: listStoreBackups().length };
+}
+
+/**
+ * Master key sanity: when users exist, one stored secret must decrypt
+ * under the configured MASTER_KEY. A lost or changed master key makes
+ * every wallet in the store unusable, so this is checked at startup
+ * and by the doctor instead of surfacing as a cryptic failure inside
+ * somebody's trade.
+ */
+export function verifyStoredSecrets(): { ok: boolean; userCount: number; detail?: string } {
+  let shape: StoreShape;
+  try {
+    shape = load();
+  } catch (err: any) {
+    return { ok: false, userCount: 0, detail: String(err?.message ?? err) };
+  }
+  const users = Object.values(shape.users);
+  if (users.length === 0) return { ok: true, userCount: 0 };
+  try {
+    decryptPrivateKey(users[0].encSecret);
+    return { ok: true, userCount: users.length };
+  } catch (err: any) {
+    return {
+      ok: false,
+      userCount: users.length,
+      detail: `decrypting a stored wallet secret failed (${String(err?.message ?? err).slice(0, 120)})`,
+    };
+  }
 }
 
 export const store = {
@@ -270,6 +454,16 @@ export const store = {
   unwatch(id: string): void {
     const shape = load();
     delete shape.watched[id];
+    delete shape.watchProgress[id];
+    save(shape);
+  },
+  /** The watcher's persisted progress for one watched wallet, if a tick has completed for it. */
+  getWatchProgress(watchId: string): WatchProgress | undefined {
+    return load().watchProgress[watchId];
+  },
+  saveWatchProgress(watchId: string, progress: WatchProgress): void {
+    const shape = load();
+    shape.watchProgress[watchId] = progress;
     save(shape);
   },
   listWatched(ownerTelegramId: number): WatchedWallet[] {

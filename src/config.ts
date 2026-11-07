@@ -74,13 +74,24 @@ function parseKnownTokens(env: Env, wnearId: string): KnownToken[] {
  * limit in bursts (the legacy near.org endpoint now intermittently
  * answers with a -429 deprecation error, and FastNear returned HTTP 429
  * under trade bursts in live use on 2026-11-07), so the bot always
- * carries more than one and rotates when one refuses a call. Verified
- * live on 2026-11-07: all six answer status calls. Lava testnet is
+ * carries more than one and rotates when one refuses a call.
+ *
+ * Verified live from the sandbox on 2026-11-07 (status calls):
+ * - testnet: rpc.testnet.fastnear.com, test.rpc.fastnear.com (the
+ *   second FastNear front door, added in the hardening pass),
+ *   near-testnet.drpc.org and rpc.testnet.near.org all answer. The
+ *   near.org endpoint is slow (about 3.7s) and stays last.
+ * - mainnet: rpc.mainnet.fastnear.com, near.drpc.org and
+ *   rpc.mainnet.near.org all answer.
+ * Checked the same day and NOT added because they did not answer:
+ * testnet.near.owline.io, mainnet.near.owline.io and the OnFinality
+ * public endpoints (fetch failed or hung). Lava testnet is
  * discontinued and deliberately not used.
  */
 export const DEFAULT_RPC_URLS: Record<"testnet" | "mainnet", string[]> = {
   testnet: [
     "https://rpc.testnet.fastnear.com",
+    "https://test.rpc.fastnear.com",
     "https://near-testnet.drpc.org",
     "https://rpc.testnet.near.org",
   ],
@@ -186,6 +197,13 @@ export function loadConfig(env: Env = process.env) {
     nearRpcUrls,
     /** First (preferred) RPC endpoint, for display and single endpoint callers. */
     nearRpcUrl: nearRpcUrls[0],
+    /**
+     * Per call RPC timeout in milliseconds (RPC_TIMEOUT_MS, default
+     * 20000). Every read and every signed attempt is bounded by it, so
+     * a hung endpoint can never hang the bot: the attempt is abandoned
+     * and the next endpoint is tried instead.
+     */
+    rpcTimeoutMs: Number(optional(env, "RPC_TIMEOUT_MS", "20000")),
     refExchangeId,
     dclExchangeId,
     wnearId,

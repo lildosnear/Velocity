@@ -1,6 +1,7 @@
 import { config, getPayCurrency, payCurrencyTokenId } from "./config";
 import { decryptPrivateKey } from "./crypto";
 import { store, type AiConfig, type CopyPosition, type UserRecord } from "./store";
+import { UserBusyError, withUserLock } from "./locks";
 import { notify } from "./notifier";
 import { payBalance, swapBuy, swapSell } from "./market";
 import { getTokenPriceNear, tokenDecimals } from "./prices";
@@ -78,53 +79,59 @@ export async function onTraderBuy(event: WalletTradeEvent): Promise<void> {
   const user = store.getUser(event.wallet.ownerTelegramId);
   const ai = user && aiActive(user);
   if (!user || !ai) return;
-  const currencyId = user.payCurrency;
-  const token = event.token;
-  if (token.id === payCurrencyTokenId(currencyId)) return; // trader moved the pay token itself, nothing to copy
+  // One money operation at a time for this user (see locks.ts): a
+  // copy that lands while the user is mid trade is refused with
+  // UserBusyError, which the watcher turns into a plain message,
+  // instead of racing the user's own trade.
+  await withUserLock(user.telegramId, async () => {
+    const currencyId = user.payCurrency;
+    const token = event.token;
+    if (token.id === payCurrencyTokenId(currencyId)) return; // trader moved the pay token itself, nothing to copy
 
-  const creds = aiCreds(ai);
-  const balance = await payBalance(creds, currencyId);
-  if (balance < ai.perTradeAmount) {
+    const creds = aiCreds(ai);
+    const balance = await payBalance(creds, currencyId);
+    if (balance < ai.perTradeAmount) {
+      await notify(
+        user.telegramId,
+        `AI wallet is low on ${currencyId} (${balance.toFixed(4)} < per trade ${ai.perTradeAmount}). ` +
+          `Top it up: ${ai.accountId}`,
+      );
+      return;
+    }
+
+    const result = await swapBuy(creds, token, ai.perTradeAmount, currencyId, config.botFeeBps);
+
+    const existing = ai.positions.find((p) => p.tokenId === token.id);
+    if (existing) {
+      const total = existing.amount + result.tokenAmount;
+      existing.entryPriceNear =
+        (existing.amount * existing.entryPriceNear + result.tokenAmount * result.priceNear) / total;
+      existing.amount = total;
+    } else {
+      ai.positions.push({
+        tokenId: token.id,
+        symbol: token.symbol,
+        amount: result.tokenAmount,
+        entryPriceNear: result.priceNear,
+        payCurrency: currencyId,
+        watchedWalletId: event.wallet.id,
+        openedAt: new Date().toISOString(),
+      });
+    }
+    user.tokens[token.id] = token;
+    store.saveUser(user);
+    store.logTrade({
+      at: new Date().toISOString(), telegramId: user.telegramId, side: "buy",
+      tokenId: token.id, symbol: token.symbol, payAmount: result.payAmount,
+      payCurrency: currencyId, nearValue: result.nearValue, tokenAmount: result.tokenAmount,
+      priceNear: result.priceNear, feeNear: result.feeNear, poolKind: result.poolKind, viaAi: true, txids: result.txids,
+    });
     await notify(
       user.telegramId,
-      `AI wallet is low on ${currencyId} (${balance.toFixed(4)} < per trade ${ai.perTradeAmount}). ` +
-        `Top it up: ${ai.accountId}`,
+      `AI copied buy: ${result.tokenAmount.toFixed(2)} ${token.symbol} for ${ai.perTradeAmount} ${currencyId} ` +
+        `(trader ${short(event.wallet.accountId)} bought ${event.amountTokens.toFixed(2)}).`,
     );
-    return;
-  }
-
-  const result = await swapBuy(creds, token, ai.perTradeAmount, currencyId, config.botFeeBps);
-
-  const existing = ai.positions.find((p) => p.tokenId === token.id);
-  if (existing) {
-    const total = existing.amount + result.tokenAmount;
-    existing.entryPriceNear =
-      (existing.amount * existing.entryPriceNear + result.tokenAmount * result.priceNear) / total;
-    existing.amount = total;
-  } else {
-    ai.positions.push({
-      tokenId: token.id,
-      symbol: token.symbol,
-      amount: result.tokenAmount,
-      entryPriceNear: result.priceNear,
-      payCurrency: currencyId,
-      watchedWalletId: event.wallet.id,
-      openedAt: new Date().toISOString(),
-    });
-  }
-  user.tokens[token.id] = token;
-  store.saveUser(user);
-  store.logTrade({
-    at: new Date().toISOString(), telegramId: user.telegramId, side: "buy",
-    tokenId: token.id, symbol: token.symbol, payAmount: result.payAmount,
-    payCurrency: currencyId, nearValue: result.nearValue, tokenAmount: result.tokenAmount,
-    priceNear: result.priceNear, feeNear: result.feeNear, poolKind: result.poolKind, viaAi: true, txids: result.txids,
   });
-  await notify(
-    user.telegramId,
-    `AI copied buy: ${result.tokenAmount.toFixed(2)} ${token.symbol} for ${ai.perTradeAmount} ${currencyId} ` +
-      `(trader ${short(event.wallet.accountId)} bought ${event.amountTokens.toFixed(2)}).`,
-  );
 }
 
 /**
@@ -174,19 +181,22 @@ export async function onTraderSell(event: WalletTradeEvent): Promise<void> {
   const user = store.getUser(event.wallet.ownerTelegramId);
   const ai = user && aiActive(user);
   if (!user || !ai) return;
-  const pos = ai.positions.find((p) => p.tokenId === event.token.id);
-  if (!pos) {
-    await notify(
-      user.telegramId,
-      `Trader ${short(event.wallet.accountId)} sold ${event.token.symbol}, but the AI holds no open position in it.`,
+  // Same per user lock as onTraderBuy (see locks.ts).
+  await withUserLock(user.telegramId, async () => {
+    const pos = ai.positions.find((p) => p.tokenId === event.token.id);
+    if (!pos) {
+      await notify(
+        user.telegramId,
+        `Trader ${short(event.wallet.accountId)} sold ${event.token.symbol}, but the AI holds no open position in it.`,
+      );
+      return;
+    }
+    const fraction = event.beforeTokens > 0 ? Math.min(1, event.amountTokens / event.beforeTokens) : 1;
+    await closePosition(
+      user, ai, pos, pos.amount * fraction,
+      `copied ${(fraction * 100).toFixed(0)}% sell from ${short(event.wallet.accountId)}`,
     );
-    return;
-  }
-  const fraction = event.beforeTokens > 0 ? Math.min(1, event.amountTokens / event.beforeTokens) : 1;
-  await closePosition(
-    user, ai, pos, pos.amount * fraction,
-    `copied ${(fraction * 100).toFixed(0)}% sell from ${short(event.wallet.accountId)}`,
-  );
+  });
 }
 
 /** Stop loss checker, call every watcher tick. */
@@ -202,9 +212,16 @@ export async function stopLossTick(): Promise<void> {
         continue;
       }
       if (price <= pos.entryPriceNear * (1 - ai.stopLossPct)) {
+        const stopPct = ai.stopLossPct; // narrowed by the guard above; captured for the closure
         try {
-          await closePosition(user, ai, pos, pos.amount, `stop loss at ${(ai.stopLossPct * 100).toFixed(0)}%`);
+          // Stop loss closes take the same per user lock as every
+          // other money operation; a busy user just skips this tick
+          // (the price is rechecked next tick), it is not a failure.
+          await withUserLock(user.telegramId, () =>
+            closePosition(user, ai, pos, pos.amount, `stop loss at ${(stopPct * 100).toFixed(0)}%`),
+          );
         } catch (err: any) {
+          if (err instanceof UserBusyError) continue;
           await notify(user.telegramId, `Stop loss failed for ${pos.symbol}: ${err?.message ?? err}`);
         }
       }

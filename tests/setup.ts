@@ -8,6 +8,7 @@ process.env.TELEGRAM_BOT_TOKEN = "test-token-not-real";
 process.env.MASTER_KEY = "11".repeat(32);
 process.env.NEAR_NETWORK = "testnet";
 process.env.DATA_DIR = mkdtempSync(join(tmpdir(), "velocity-test-"));
+process.env.VELOCITY_LOG_DIR = join(process.env.DATA_DIR, "logs");
 process.env.BOT_USERNAME = "VelocityTestBot";
 // Keep tests hermetic against the operator .env in the repo root
 // (dotenv never overrides variables that are already set).
