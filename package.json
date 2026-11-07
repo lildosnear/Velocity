@@ -1,0 +1,32 @@
+{
+  "dependencies": {
+    "dotenv": "17.2.3",
+    "grammy": "1.46.0",
+    "near-api-js": "^5.1.0",
+    "sharp": "^0.35.5"
+  },
+  "description": "Velocity: Telegram trading bot for NEAR, the Forge product rebuilt for NEAR and Rhea Finance.",
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "tsx": "4.19.2",
+    "typescript": "5.7.2"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "name": "velocity-trade-bot",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "live-swap": "tsx scripts/live-swap-proof.ts",
+    "make-fee-wallet": "tsx scripts/make-fee-wallet.ts",
+    "render-cards": "tsx scripts/render-test-cards.ts",
+    "smoke": "tsx src/smoke.ts",
+    "start": "node dist/index.js",
+    "test": "tsx --test tests/fees.test.ts tests/pnl.test.ts tests/quotes.test.ts tests/dcl.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "type": "commonjs",
+  "version": "0.1.0"
+}
