@@ -1,4 +1,4 @@
-import { connect, KeyPair, keyStores, Account } from "near-api-js";
+import { connect, KeyPair, keyStores, Account, providers } from "near-api-js";
 import { config } from "./config";
 
 /**
@@ -38,11 +38,28 @@ function getKeyStore() {
   return keyStore;
 }
 
+let failoverProvider: InstanceType<typeof providers.FailoverRpcProvider> | undefined;
+
+/**
+ * One provider over every configured RPC endpoint. near-api-js rotates
+ * to the next endpoint when a call errors, so a rate limited or down
+ * provider does not fail signed calls (transfers, swaps) either.
+ */
+function getProvider() {
+  if (!failoverProvider) {
+    failoverProvider = new providers.FailoverRpcProvider(
+      config.nearRpcUrls.map((url) => new providers.JsonRpcProvider({ url })),
+    );
+  }
+  return failoverProvider;
+}
+
 async function nearConnection() {
   return connect({
     networkId: config.network,
     keyStore: getKeyStore(),
-    nodeUrl: config.nearRpcUrl,
+    nodeUrl: config.nearRpcUrls[0],
+    provider: getProvider(),
   });
 }
 
@@ -94,16 +111,119 @@ interface RpcResult<T> {
   error?: any;
 }
 
-async function rpc<T>(method: string, params: any): Promise<T> {
-  const res = await fetch(config.nearRpcUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: "velocity", method, params }),
-  });
-  if (!res.ok) throw new Error(`NEAR RPC ${method} returned HTTP ${res.status}`);
-  const json = (await res.json()) as RpcResult<T>;
-  if (json.error) throw new Error(`NEAR RPC ${method} error: ${JSON.stringify(json.error).slice(0, 300)}`);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type RpcError = Error & { retryable?: boolean };
+
+function rpcError(message: string, retryable: boolean): RpcError {
+  const err = new Error(message) as RpcError;
+  err.retryable = retryable;
+  return err;
+}
+
+/**
+ * One JSON RPC attempt against one endpoint. Retryable failures (HTTP
+ * 429, HTTP 5xx, network errors, and JSON RPC error code -429, the
+ * deprecation rejection the legacy endpoint serves) are flagged so the
+ * caller can rotate; deterministic errors (a missing account, a missing
+ * method) throw with the same messages callers have always matched on.
+ */
+async function rpcAttempt<T>(url: string, method: string, params: any): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "velocity", method, params }),
+    });
+  } catch (err: any) {
+    throw rpcError(`NEAR RPC ${method} network error: ${err?.message ?? err}`, true);
+  }
+  if (!res.ok) {
+    throw rpcError(`NEAR RPC ${method} returned HTTP ${res.status}`, res.status === 429 || res.status >= 500);
+  }
+  let json: RpcResult<T>;
+  try {
+    json = (await res.json()) as RpcResult<T>;
+  } catch (err: any) {
+    throw rpcError(`NEAR RPC ${method} returned an unreadable response: ${err?.message ?? err}`, true);
+  }
+  if (json.error) {
+    const code = Number((json.error as any)?.code);
+    throw rpcError(
+      `NEAR RPC ${method} error: ${JSON.stringify(json.error).slice(0, 300)}`,
+      code === -429 || code === 429,
+    );
+  }
   return json.result as T;
+}
+
+export interface RpcCaller {
+  readonly urls: string[];
+  call<T>(method: string, params: any): Promise<T>;
+}
+
+/**
+ * A JSON RPC caller over an ordered endpoint list. A retryable failure
+ * rotates to the next endpoint after a short backoff; whichever
+ * endpoint answers becomes the preferred one for the next call, so a
+ * rate limited provider is not retried head on for every request.
+ */
+export function createRpcCaller(urls: string[]): RpcCaller {
+  let preferred = 0;
+  return {
+    urls,
+    async call<T>(method: string, params: any): Promise<T> {
+      let lastErr: any;
+      for (let attempt = 0; attempt < urls.length; attempt++) {
+        const idx = (preferred + attempt) % urls.length;
+        try {
+          const value = await rpcAttempt<T>(urls[idx], method, params);
+          preferred = idx;
+          return value;
+        } catch (err: any) {
+          lastErr = err;
+          if (!err?.retryable) throw err;
+          if (attempt < urls.length - 1) await sleep(250 * (attempt + 1));
+        }
+      }
+      throw lastErr;
+    },
+  };
+}
+
+const defaultRpcCaller = createRpcCaller(config.nearRpcUrls);
+
+async function rpc<T>(method: string, params: any): Promise<T> {
+  return defaultRpcCaller.call<T>(method, params);
+}
+
+/**
+ * Run an async mapper over items with bounded concurrency, preserving
+ * input order in the results. Used to parallelize pool reads and quote
+ * calls that used to run one at a time and trip RPC rate limits.
+ */
+export async function parallelMap<I, O>(
+  items: I[],
+  limit: number,
+  fn: (item: I, index: number) => Promise<O>,
+): Promise<O[]> {
+  const results = new Array<O>(items.length);
+  let next = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const i = next;
+        next += 1;
+        if (i >= items.length) return;
+        results[i] = await fn(items[i], i);
+      }
+    }),
+  );
+  return results;
 }
 
 export async function rpcBlockHeight(): Promise<number> {

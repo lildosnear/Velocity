@@ -1,7 +1,8 @@
-import { config } from "./config";
+import { config, DEFAULT_RPC_URLS } from "./config";
 import { encryptPrivateKey } from "./crypto";
 import {
   accountExists,
+  createRpcCaller,
   createWallet,
   getFtMetadata,
   readNearBalance,
@@ -28,7 +29,7 @@ async function main() {
     return;
   }
 
-  console.log(`Network: ${config.network}  RPC: ${config.nearRpcUrl}`);
+  console.log(`Network: ${config.network}  RPC endpoints (failover order): ${config.nearRpcUrls.join(", ")}`);
   const height = await rpcBlockHeight();
   console.log("RPC ok. Block height:", height);
 
@@ -58,30 +59,21 @@ async function main() {
     // contract, never a transaction. This proves the DCL quote path
     // end to end while testnet has no DCL deployment.
     try {
-      const res = await fetch("https://rpc.mainnet.near.org", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "velocity-smoke",
-          method: "query",
-          params: {
-            request_type: "call_function",
-            finality: "optimistic",
-            account_id: "dclv2.ref-labs.near",
-            method_name: "quote",
-            args_base64: Buffer.from(JSON.stringify({
-              pool_ids: ["a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.factory.bridge.near|wrap.near|2000"],
-              input_token: "wrap.near",
-              output_token: "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.factory.bridge.near",
-              input_amount: "100000000000000000000000",
-              tag: "velocity-smoke",
-            })).toString("base64"),
-          },
-        }),
+      const mainnetCaller = createRpcCaller(DEFAULT_RPC_URLS.mainnet);
+      const result = await mainnetCaller.call<{ result: number[] }>("query", {
+        request_type: "call_function",
+        finality: "optimistic",
+        account_id: "dclv2.ref-labs.near",
+        method_name: "quote",
+        args_base64: Buffer.from(JSON.stringify({
+          pool_ids: ["a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.factory.bridge.near|wrap.near|2000"],
+          input_token: "wrap.near",
+          output_token: "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.factory.bridge.near",
+          input_amount: "100000000000000000000000",
+          tag: "velocity-smoke",
+        })).toString("base64"),
       });
-      const json: any = await res.json();
-      const out = JSON.parse(Buffer.from(json.result.result).toString("utf8"));
+      const out = JSON.parse(Buffer.from(result.result).toString("utf8"));
       console.log(`Mainnet DCL read only quote: 0.1 wNEAR -> ${out.amount} raw bridged USDC via dclv2.ref-labs.near.`);
     } catch (err: any) {
       console.log("Mainnet DCL read only quote check failed:", err?.message ?? err);

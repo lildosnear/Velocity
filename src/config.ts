@@ -9,7 +9,6 @@ function optional(name: string, fallback: string): string {
   return process.env[name] ?? fallback;
 }
 
-
 /**
  * Pay currencies the bot accepts. NEAR is native. USDC and USDT are fungible
  * tokens (NEP 141) whose contract ids come from the environment, because
@@ -54,7 +53,43 @@ function parseKnownTokens(wnearId: string, network: string): KnownToken[] {
   return [{ id: wnearId, symbol: "wNEAR", decimals: 24 }];
 }
 
+/**
+ * Default NEAR RPC endpoints, in failover order. Public endpoints rate
+ * limit in bursts (the legacy near.org endpoint now intermittently
+ * answers with a -429 deprecation error, and FastNear returned HTTP 429
+ * under trade bursts in live use on 2026-11-07), so the bot always
+ * carries more than one and rotates when one refuses a call. Verified
+ * live on 2026-11-07: all six answer status calls. Lava testnet is
+ * discontinued and deliberately not used.
+ */
+export const DEFAULT_RPC_URLS: Record<"testnet" | "mainnet", string[]> = {
+  testnet: [
+    "https://rpc.testnet.fastnear.com",
+    "https://near-testnet.drpc.org",
+    "https://rpc.testnet.near.org",
+  ],
+  mainnet: [
+    "https://rpc.mainnet.fastnear.com",
+    "https://near.drpc.org",
+    "https://rpc.mainnet.near.org",
+  ],
+};
+
+/**
+ * Parse a NEAR_RPC_URL value into an ordered endpoint list. The value is
+ * comma separated; blank entries are dropped and duplicates removed.
+ * An unset or empty value falls back to the network defaults. Pure,
+ * unit tested.
+ */
+export function parseRpcUrls(raw: string | undefined, network: string): string[] {
+  const fallback = DEFAULT_RPC_URLS[network === "mainnet" ? "mainnet" : "testnet"];
+  if (!raw) return [...fallback];
+  const urls = [...new Set(raw.split(",").map((u) => u.trim()).filter((u) => u.length > 0))];
+  return urls.length > 0 ? urls : [...fallback];
+}
+
 const network = optional("NEAR_NETWORK", "testnet") as "testnet" | "mainnet";
+const nearRpcUrls = parseRpcUrls(process.env["NEAR_RPC_URL"], network);
 const wnearId = optional("WNEAR_ID", network === "mainnet" ? "wrap.near" : "wrap.testnet");
 // Verified live on 2026-11-06: v2.ref-finance.testnet does not exist.
 // The live Ref exchange on testnet is ref-finance.testnet (196 simple
@@ -96,10 +131,10 @@ export const config = {
   telegramBotToken: required("TELEGRAM_BOT_TOKEN"),
   masterKeyHex: required("MASTER_KEY"),
   network,
-  nearRpcUrl: optional(
-    "NEAR_RPC_URL",
-    network === "mainnet" ? "https://rpc.mainnet.near.org" : "https://rpc.testnet.near.org",
-  ),
+  /** Ordered RPC endpoint list (NEAR_RPC_URL accepts a comma separated list); calls fail over down the list. */
+  nearRpcUrls,
+  /** First (preferred) RPC endpoint, for display and single endpoint callers. */
+  nearRpcUrl: nearRpcUrls[0],
   refExchangeId,
   dclExchangeId,
   wnearId,

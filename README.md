@@ -62,6 +62,15 @@ on the NEAR value of each trade, whichever pool kind fills it.
    - `BOT_USERNAME`, your bot username without the @, for referral links.
    - `MASTER_KEY`, generate it with:
      `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+   - `NEAR_RPC_URL` comes prefilled with a comma separated list of RPC
+     endpoints; leave it as is. When an endpoint rate limits (HTTP 429,
+     or the legacy endpoint's -429 deprecation error) or drops a call,
+     the bot retries the same call against the next endpoint in the
+     list, for reads and signed transactions alike, instead of failing
+     the command. Defaults: testnet FastNear, dRPC, then the legacy
+     NEAR endpoint; mainnet uses the matching mainnet set. Pool scans
+     are also cached for a minute, so quoting does not rescan the
+     exchange on every trade.
 5. Create the fee wallet: `npm run make-fee-wallet`. It prints
    `FEE_ACCOUNT_ID` and `FEE_ACCOUNT_SECRET_ENC` ready to paste into
    `.env`, then fund that account with a little NEAR (it pays referral

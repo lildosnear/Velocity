@@ -1,5 +1,5 @@
 import { config } from "./config";
-import { viewFunction } from "./near";
+import { parallelMap, viewFunction } from "./near";
 
 /**
  * Rhea DCL (discretized concentrated liquidity) exchange reads.
@@ -62,49 +62,68 @@ export function dclPoolId(tokenA: string, tokenB: string, fee: number): string {
 
 const dclCache = new Map<string, DclPool>();
 let dclScanAt = 0;
+let dclScanDone = false;
 let dclScanned = 0;
 
 /**
  * Scan DCL pools on the configured DCL exchange. Mainnet carries
  * thousands of pools, so the scan is bounded (default 2000 pools, pages
- * of 100) and cached for a minute, the same pattern as the simple pool
- * scan. Returns an empty list when the contract does not exist on this
- * network, which is the testnet case today.
+ * of 100 fetched in parallel batches of 8). The completed scan is
+ * cached for a minute, the same pattern as the simple pool scan, and
+ * the cache also holds when the scan finds nothing, so testnet does
+ * not re-probe the missing contract on every quote. Returns an empty
+ * list when the contract does not exist on this network, which is the
+ * testnet case today.
  */
 export async function scanDclPools(maxPools = 2000): Promise<DclPool[]> {
-  if (Date.now() - dclScanAt < 60_000 && dclScanned > 0) {
+  if (dclScanDone && Date.now() - dclScanAt < 60_000) {
     return [...dclCache.values()];
   }
   dclCache.clear();
+  const PAGE = 100;
+  const BATCH = 8;
   let total = 0;
-  while (total < maxPools) {
-    let page: RawDclPool[] | undefined;
-    try {
-      page = await viewFunction<RawDclPool[]>(config.dclExchangeId, "list_pools", {
-        from_index: total,
-        limit: 100,
-      });
-    } catch {
-      break;
+  let exhausted = false;
+  while (total < maxPools && !exhausted) {
+    const starts: number[] = [];
+    for (let s = total; s < Math.min(total + PAGE * BATCH, maxPools); s += PAGE) starts.push(s);
+    const pages = await parallelMap(starts, BATCH, async (from) => {
+      try {
+        return await viewFunction<RawDclPool[]>(config.dclExchangeId, "list_pools", {
+          from_index: from,
+          limit: PAGE,
+        });
+      } catch {
+        return undefined;
+      }
+    });
+    for (const page of pages) {
+      if (!page || page.length === 0) {
+        exhausted = true;
+        break;
+      }
+      for (const raw of page) {
+        total += 1;
+        if (!raw.pool_id || !raw.token_x || !raw.token_y) continue;
+        dclCache.set(raw.pool_id, {
+          poolId: raw.pool_id,
+          tokenX: raw.token_x,
+          tokenY: raw.token_y,
+          fee: Number(raw.fee),
+          pointDelta: Number(raw.point_delta),
+          currentPoint: Number(raw.current_point),
+          liquidity: BigInt(raw.liquidity ?? "0"),
+        });
+      }
+      if (page.length < PAGE) {
+        exhausted = true;
+        break;
+      }
     }
-    if (!page || page.length === 0) break;
-    for (const raw of page) {
-      total += 1;
-      if (!raw.pool_id || !raw.token_x || !raw.token_y) continue;
-      dclCache.set(raw.pool_id, {
-        poolId: raw.pool_id,
-        tokenX: raw.token_x,
-        tokenY: raw.token_y,
-        fee: Number(raw.fee),
-        pointDelta: Number(raw.point_delta),
-        currentPoint: Number(raw.current_point),
-        liquidity: BigInt(raw.liquidity ?? "0"),
-      });
-    }
-    if (page.length < 100) break;
   }
   dclScanned = total;
   dclScanAt = Date.now();
+  dclScanDone = true;
   return [...dclCache.values()];
 }
 
@@ -185,22 +204,26 @@ export async function findDclRoute(
     if (!best || q.amountOutRaw > best.amountOutRaw) best = q;
   };
 
+  // Quote candidate pools in parallel (bounded), then consider the
+  // results in pool order so ties resolve as the sequential version did.
   const direct = pools.filter((p) => p.liquidity > 0n && pair(p, tokenIn, tokenOut));
-  for (const pool of direct) {
+  const directOuts = await parallelMap(direct, 8, async (pool) => {
     try {
-      const out = await quote([pool.poolId], tokenIn, tokenOut, amountInRaw);
-      consider({
-        tokenIn,
-        tokenOut,
-        amountInRaw,
-        amountOutRaw: out,
-        poolIds: [pool.poolId],
-        description: `${tokenIn} -> ${tokenOut} via DCL pool ${pool.poolId}`,
-      });
+      return await quote([pool.poolId], tokenIn, tokenOut, amountInRaw);
     } catch {
-      continue;
+      return 0n;
     }
-  }
+  });
+  direct.forEach((pool, i) => {
+    consider({
+      tokenIn,
+      tokenOut,
+      amountInRaw,
+      amountOutRaw: directOuts[i],
+      poolIds: [pool.poolId],
+      description: `${tokenIn} -> ${tokenOut} via DCL pool ${pool.poolId}`,
+    });
+  });
   if (best) return best;
 
   // Two hops through wNEAR, quoted as one pool path by the contract.
@@ -208,23 +231,27 @@ export async function findDclRoute(
   if (tokenIn !== mid && tokenOut !== mid) {
     const firstLegs = pools.filter((p) => p.liquidity > 0n && pair(p, tokenIn, mid));
     const secondLegs = pools.filter((p) => p.liquidity > 0n && pair(p, mid, tokenOut));
+    const combos: { p1: DclPool; p2: DclPool }[] = [];
     for (const p1 of firstLegs) {
-      for (const p2 of secondLegs) {
-        try {
-          const out = await quote([p1.poolId, p2.poolId], tokenIn, tokenOut, amountInRaw);
-          consider({
-            tokenIn,
-            tokenOut,
-            amountInRaw,
-            amountOutRaw: out,
-            poolIds: [p1.poolId, p2.poolId],
-            description: `${tokenIn} -> ${mid} -> ${tokenOut} via DCL pools ${p1.poolId} and ${p2.poolId}`,
-          });
-        } catch {
-          continue;
-        }
-      }
+      for (const p2 of secondLegs) combos.push({ p1, p2 });
     }
+    const comboOuts = await parallelMap(combos, 8, async (c) => {
+      try {
+        return await quote([c.p1.poolId, c.p2.poolId], tokenIn, tokenOut, amountInRaw);
+      } catch {
+        return 0n;
+      }
+    });
+    combos.forEach((c, i) => {
+      consider({
+        tokenIn,
+        tokenOut,
+        amountInRaw,
+        amountOutRaw: comboOuts[i],
+        poolIds: [c.p1.poolId, c.p2.poolId],
+        description: `${tokenIn} -> ${mid} -> ${tokenOut} via DCL pools ${c.p1.poolId} and ${c.p2.poolId}`,
+      });
+    });
   }
   if (best) return best;
   throw new Error(`No DCL route from ${tokenIn} to ${tokenOut} on ${config.dclExchangeId}.`);

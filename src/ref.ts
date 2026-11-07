@@ -1,5 +1,5 @@
 import { config } from "./config";
-import { viewFunction } from "./near";
+import { parallelMap, viewFunction } from "./near";
 import { findDclRoute } from "./dcl";
 
 /**
@@ -30,7 +30,11 @@ interface RawPool {
 
 const poolCache = new Map<number, RefPool>();
 let poolScanAt = 0;
+let poolScanDone = false;
 let scannedCount = 0;
+
+/** How long a completed pool scan is reused before rescanning. */
+export const POOL_SCAN_TTL_MS = 60_000;
 
 async function fetchPoolPage(fromIndex: number, limit: number): Promise<RawPool[]> {
   const page = await viewFunction<RawPool[]>(config.refExchangeId, "get_pools", {
@@ -42,37 +46,50 @@ async function fetchPoolPage(fromIndex: number, limit: number): Promise<RawPool[
 
 /**
  * Scan simple pools on the exchange. Ref testnet carries a modest number
- * of pools, so a bounded scan (default 500 pools, pages of 100) is fine
- * and cached for a minute. DCL pools are scanned separately in dcl.ts.
+ * of pools, so a bounded scan (default 500 pools, pages of 100) is fine.
+ * Pages are fetched in parallel batches of 5 and the completed scan is
+ * cached for a minute, so repeat quotes and watcher ticks do not
+ * rescan the exchange (a full rescan per quote used to take ~20s and
+ * trip public RPC rate limits). DCL pools are scanned in dcl.ts.
  */
 export async function scanPools(maxPools = 500): Promise<RefPool[]> {
-  if (Date.now() - poolScanAt < 60_000 && scannedCount > 0) {
+  if (poolScanDone && Date.now() - poolScanAt < POOL_SCAN_TTL_MS) {
     return [...poolCache.values()].sort((a, b) => a.id - b.id);
   }
   poolCache.clear();
-  let index = 0;
+  const PAGE = 100;
+  const BATCH = 5;
   let total = 0;
-  while (total < maxPools) {
-    const page = await fetchPoolPage(index, 100);
-    if (page.length === 0) break;
-    for (const raw of page) {
-      const id = index;
-      index += 1;
-      total += 1;
-      // Simple pools have exactly the plain shape; skip anything exotic.
-      if (!Array.isArray(raw.token_account_ids) || !Array.isArray(raw.amounts)) continue;
-      poolCache.set(id, {
-        id,
-        tokenIds: raw.token_account_ids,
-        amountsRaw: raw.amounts.map((a) => BigInt(a)),
-        totalFee: Number(raw.total_fee),
-        sharesTotalSupply: BigInt(raw.shares_total_supply ?? "0"),
-      });
+  let exhausted = false;
+  while (total < maxPools && !exhausted) {
+    const starts: number[] = [];
+    for (let s = total; s < Math.min(total + PAGE * BATCH, maxPools); s += PAGE) starts.push(s);
+    const pages = await parallelMap(starts, BATCH, (from) => fetchPoolPage(from, PAGE));
+    for (let b = 0; b < pages.length; b++) {
+      const page = pages[b];
+      for (let i = 0; i < page.length; i++) {
+        const raw = page[i];
+        const id = starts[b] + i;
+        total += 1;
+        // Simple pools have exactly the plain shape; skip anything exotic.
+        if (!Array.isArray(raw.token_account_ids) || !Array.isArray(raw.amounts)) continue;
+        poolCache.set(id, {
+          id,
+          tokenIds: raw.token_account_ids,
+          amountsRaw: raw.amounts.map((a) => BigInt(a)),
+          totalFee: Number(raw.total_fee),
+          sharesTotalSupply: BigInt(raw.shares_total_supply ?? "0"),
+        });
+      }
+      if (page.length < PAGE) {
+        exhausted = true;
+        break;
+      }
     }
-    if (page.length < 100) break;
   }
   scannedCount = total;
   poolScanAt = Date.now();
+  poolScanDone = true;
   return [...poolCache.values()].sort((a, b) => a.id - b.id);
 }
 
@@ -174,10 +191,68 @@ export async function findSimpleRoute(tokenIn: string, tokenOut: string, amountI
     if (!best || q.amountOutRaw > best.amountOutRaw) best = q;
   };
 
-  for (const pool of direct) {
+  // Quote every direct pool in parallel (bounded), then consider the
+  // results in pool order so ties resolve exactly as the sequential
+  // version did: first pool with the best output wins.
+  const directOuts = await parallelMap(direct, 8, async (pool) => {
     try {
-      const out = await getReturn(pool.id, tokenIn, tokenOut, amountInRaw);
-      if (out <= 0n) continue;
+      return await getReturn(pool.id, tokenIn, tokenOut, amountInRaw);
+    } catch {
+      return 0n;
+    }
+  });
+  direct.forEach((pool, i) => {
+    const out = directOuts[i];
+    if (out <= 0n) return;
+    consider({
+      tokenIn,
+      tokenOut,
+      amountInRaw,
+      amountOutRaw: out,
+      kind: "simple",
+      exchangeId: config.refExchangeId,
+      actions: [
+        {
+          pool_id: pool.id,
+          token_in: tokenIn,
+          token_out: tokenOut,
+          amount_in: amountInRaw.toString(),
+          min_amount_out: applySlippage(out, config.slippageBps).toString(),
+        },
+      ],
+      dclPoolIds: [],
+      description: `${tokenIn} -> ${tokenOut} via pool ${pool.id}`,
+    });
+  });
+  if (best) return best;
+
+  // Two hop route through wNEAR.
+  const mid = config.wnearId;
+  if (tokenIn !== mid && tokenOut !== mid) {
+    const firstLegs = pools.filter((p) => p.tokenIds.includes(tokenIn) && p.tokenIds.includes(mid));
+    const secondLegs = pools.filter((p) => p.tokenIds.includes(mid) && p.tokenIds.includes(tokenOut));
+    const midOuts = await parallelMap(firstLegs, 8, async (p1) => {
+      try {
+        return await getReturn(p1.id, tokenIn, mid, amountInRaw);
+      } catch {
+        return 0n;
+      }
+    });
+    const combos: { p1: RefPool; p2: RefPool; midOut: bigint }[] = [];
+    firstLegs.forEach((p1, i) => {
+      if (midOuts[i] <= 0n) return;
+      for (const p2 of secondLegs) combos.push({ p1, p2, midOut: midOuts[i] });
+    });
+    const comboOuts = await parallelMap(combos, 8, async (c) => {
+      try {
+        return await getReturn(c.p2.id, mid, tokenOut, c.midOut);
+      } catch {
+        return 0n;
+      }
+    });
+    combos.forEach((c, i) => {
+      const out = comboOuts[i];
+      if (out <= 0n) return;
       consider({
         tokenIn,
         tokenOut,
@@ -187,69 +262,23 @@ export async function findSimpleRoute(tokenIn: string, tokenOut: string, amountI
         exchangeId: config.refExchangeId,
         actions: [
           {
-            pool_id: pool.id,
+            pool_id: c.p1.id,
             token_in: tokenIn,
-            token_out: tokenOut,
+            token_out: mid,
             amount_in: amountInRaw.toString(),
+            min_amount_out: "0",
+          },
+          {
+            pool_id: c.p2.id,
+            token_in: mid,
+            token_out: tokenOut,
             min_amount_out: applySlippage(out, config.slippageBps).toString(),
           },
         ],
         dclPoolIds: [],
-        description: `${tokenIn} -> ${tokenOut} via pool ${pool.id}`,
+        description: `${tokenIn} -> ${mid} -> ${tokenOut} via pools ${c.p1.id} and ${c.p2.id}`,
       });
-    } catch {
-      continue;
-    }
-  }
-  if (best) return best;
-
-  // Two hop route through wNEAR.
-  const mid = config.wnearId;
-  if (tokenIn !== mid && tokenOut !== mid) {
-    const firstLegs = pools.filter((p) => p.tokenIds.includes(tokenIn) && p.tokenIds.includes(mid));
-    const secondLegs = pools.filter((p) => p.tokenIds.includes(mid) && p.tokenIds.includes(tokenOut));
-    for (const p1 of firstLegs) {
-      let midOut: bigint;
-      try {
-        midOut = await getReturn(p1.id, tokenIn, mid, amountInRaw);
-      } catch {
-        continue;
-      }
-      if (midOut <= 0n) continue;
-      for (const p2 of secondLegs) {
-        try {
-          const out = await getReturn(p2.id, mid, tokenOut, midOut);
-          if (out <= 0n) continue;
-          consider({
-            tokenIn,
-            tokenOut,
-            amountInRaw,
-            amountOutRaw: out,
-            kind: "simple",
-            exchangeId: config.refExchangeId,
-            actions: [
-              {
-                pool_id: p1.id,
-                token_in: tokenIn,
-                token_out: mid,
-                amount_in: amountInRaw.toString(),
-                min_amount_out: "0",
-              },
-              {
-                pool_id: p2.id,
-                token_in: mid,
-                token_out: tokenOut,
-                min_amount_out: applySlippage(out, config.slippageBps).toString(),
-              },
-            ],
-            dclPoolIds: [],
-            description: `${tokenIn} -> ${mid} -> ${tokenOut} via pools ${p1.id} and ${p2.id}`,
-          });
-        } catch {
-          continue;
-        }
-      }
-    }
+    });
   }
   if (best) return best;
   throw new Error(`No simple pool route from ${tokenIn} to ${tokenOut} on ${config.refExchangeId}.`);
