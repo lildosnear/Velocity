@@ -242,9 +242,22 @@ export async function viewFunction<T>(contractId: string, methodName: string, ar
       method_name: methodName,
       args_base64: argsBase64,
     });
+    if (!result || !Array.isArray(result.result)) return undefined;
     const bytes = Buffer.from(result.result);
     if (bytes.length === 0) return undefined;
-    return JSON.parse(bytes.toString("utf8")) as T;
+    const parsed = JSON.parse(bytes.toString("utf8"));
+    // Some contracts return their JSON double encoded, as a string that
+    // itself contains JSON. Unwrap one such layer when the string plainly
+    // holds an object or array. Plain string results (token balances and
+    // the like) never start with a brace, so they pass through untouched.
+    if (typeof parsed === "string" && parsed.trimStart().startsWith("{")) {
+      try {
+        return JSON.parse(parsed) as T;
+      } catch {
+        return parsed as T;
+      }
+    }
+    return parsed as T;
   } catch (err: any) {
     const msg = String(err?.message ?? err);
     if (msg.includes("does not exist") || msg.includes("no contract code") || msg.includes("MethodNotFound") || msg.includes("method not found")) {
@@ -326,10 +339,29 @@ export interface FtMetadata {
 
 const metadataCache = new Map<string, FtMetadata>();
 
+/**
+ * Shape check for ft_metadata results. Some contracts answer with an
+ * incomplete object (or, before viewFunction unwraps it, a string), and
+ * callers read symbol and decimals unconditionally, so anything that is
+ * not a complete metadata object is treated as no metadata at all.
+ */
+export function normalizeFtMetadata(raw: unknown): FtMetadata | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const m = raw as Partial<FtMetadata>;
+  if (typeof m.symbol !== "string" || m.symbol.length === 0) return undefined;
+  if (typeof m.decimals !== "number" || !Number.isFinite(m.decimals)) return undefined;
+  return {
+    spec: typeof m.spec === "string" ? m.spec : "",
+    name: typeof m.name === "string" ? m.name : m.symbol,
+    symbol: m.symbol,
+    decimals: m.decimals,
+  };
+}
+
 export async function getFtMetadata(contractId: string): Promise<FtMetadata | undefined> {
   const cached = metadataCache.get(contractId);
   if (cached) return cached;
-  const meta = await viewFunction<FtMetadata>(contractId, "ft_metadata");
+  const meta = normalizeFtMetadata(await viewFunction(contractId, "ft_metadata"));
   if (meta) metadataCache.set(contractId, meta);
   return meta;
 }

@@ -152,3 +152,46 @@ test("pool scan is cached: a second scan within the TTL makes no new RPC calls",
     globalThis.fetch = realFetch;
   }
 });
+
+// --- metadata hardening ------------------------------------------------------
+
+import { normalizeFtMetadata, getFtMetadata } from "../src/near";
+
+test("normalizeFtMetadata accepts a complete metadata object", () => {
+  const meta = normalizeFtMetadata({ spec: "ft-1.0.0", name: "Token", symbol: "TKN", decimals: 6 });
+  assert.equal(meta?.symbol, "TKN");
+  assert.equal(meta?.decimals, 6);
+});
+
+test("normalizeFtMetadata rejects strings, partial objects and missing fields", () => {
+  assert.equal(normalizeFtMetadata("{\"symbol\":\"MET\",\"decimals\":18}"), undefined);
+  assert.equal(normalizeFtMetadata({ name: "No Symbol", decimals: 6 }), undefined);
+  assert.equal(normalizeFtMetadata({ symbol: "", decimals: 6 }), undefined);
+  assert.equal(normalizeFtMetadata({ symbol: "TKN" }), undefined);
+  assert.equal(normalizeFtMetadata(undefined), undefined);
+  assert.equal(normalizeFtMetadata(null), undefined);
+});
+
+test("getFtMetadata unwraps double encoded metadata from a contract", async () => {
+  const inner = JSON.stringify({ spec: "ft-1.0.0", name: "Mock", symbol: "MET", decimals: 18 });
+  const outer = JSON.stringify(inner);
+  const bytes = [...Buffer.from(outer, "utf8")];
+  stubFetch(() => jsonRpcOk({ result: bytes }));
+  try {
+    const meta = await getFtMetadata("double-encoded-ft.testnet");
+    assert.equal(meta?.symbol, "MET");
+    assert.equal(meta?.decimals, 18);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("getFtMetadata returns undefined when the RPC result has no byte array", async () => {
+  stubFetch(() => jsonRpcOk({}));
+  try {
+    const meta = await getFtMetadata("empty-result-ft.testnet");
+    assert.equal(meta, undefined);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
