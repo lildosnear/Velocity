@@ -12,11 +12,18 @@ import {
 } from "./near";
 import {
   credsOf,
+  defaultParkedFundsDeps,
   executeBuy,
   executeSell,
+  fromRaw,
   getFeeWallet,
+  parkedBalances,
   payBalance,
+  recoverCandidates,
+  recoverParkedFunds,
   resolveToken,
+  type ParkedFundsDeps,
+  type RecoverOutcome,
 } from "./market";
 import { getTokenPriceNear, tokenDecimals } from "./prices";
 import {
@@ -90,7 +97,28 @@ function nameCreatedLines(user: { legacyAccountId?: string }, result: NameAttemp
   return lines;
 }
 
-export function registerCommands(bot: Bot, nameDeps: NamePromptDeps = defaultNamePromptDeps) {
+/** One token's worth of /recover reply lines: what landed, and what could not be moved. */
+function recoverLines(outcome: RecoverOutcome, label?: string): string[] {
+  const prefix = label ? `${label}: ` : "";
+  const lines: string[] = [];
+  for (const r of outcome.recovered) {
+    lines.push(
+      r.unwrapped
+        ? `${prefix}Recovered ${fmt(r.amount, 8)} NEAR from the exchange (it was parked as wNEAR, now unwrapped), in your wallet.`
+        : `${prefix}Recovered ${fmt(r.amount, 8)} ${r.token.symbol} from the exchange, now in your wallet.`,
+    );
+  }
+  for (const f of outcome.failures) {
+    lines.push(`${prefix}Could not recover ${f.token.symbol}: ${f.error.slice(0, 200)}`);
+  }
+  return lines;
+}
+
+export function registerCommands(
+  bot: Bot,
+  nameDeps: NamePromptDeps = defaultNamePromptDeps,
+  parkedDeps: ParkedFundsDeps = defaultParkedFundsDeps,
+) {
   // Wallet name prompt interception, registered before every command
   // so it sees text messages first. While a user's pendingNamePrompt
   // flag is set (by /start for a brand new user, or by /name with no
@@ -191,6 +219,7 @@ export function registerCommands(bot: Bot, nameDeps: NamePromptDeps = defaultNam
         "/sell TOKEN AMOUNT [CURRENCY], sell tokens\n" +
         "/paycurrency, choose NEAR, USDC or USDT\n" +
         "/balance, your balances\n" +
+        "/recover, pull funds parked inside the exchange back into your wallet\n" +
         "/pnl [TOKEN], shareable PnL win card\n" +
         "/ref, your referral link and earnings\n" +
         "/withdraw ACCOUNT [AMOUNT], withdraw NEAR\n" +
@@ -332,7 +361,55 @@ export function registerCommands(bot: Bot, nameDeps: NamePromptDeps = defaultNam
         continue;
       }
     }
+    // Parked funds: tokens sitting in the exchange internal account
+    // after an interrupted trade are not in the wallet, so they are
+    // not in the balances above. A light check over the tokens the
+    // bot knows for this user (no discovery scan) surfaces them with
+    // the way back. A failed check never breaks /balance.
+    try {
+      const candidates = await recoverCandidates(user);
+      const { parked } = await parkedBalances(creds, candidates, parkedDeps);
+      for (const p of parked) {
+        lines.push(
+          `You also have ${fmt(fromRaw(p.raw, p.token.decimals), 8)} ${p.token.symbol} parked inside the exchange. Send /recover to pull it into your wallet.`,
+        );
+      }
+    } catch {
+      // Parked funds stay discoverable through /recover itself.
+    }
     await ctx.reply("Your balances:\n" + lines.join("\n"));
+  });
+
+  bot.command("recover", async (ctx) => {
+    const user = await getOrCreateUser(ctx);
+    const wait = await ctx.reply("Checking the exchange for parked funds...");
+    try {
+      const extras = await parkedDeps.extraCandidates().catch(() => []);
+      const candidates = await recoverCandidates(user, extras);
+      const lines: string[] = [];
+      const main = await recoverParkedFunds(credsOf(user), candidates, parkedDeps);
+      lines.push(...recoverLines(main));
+      // The AI wallet trades through the same exchange flow, so it can
+      // park funds the same way. Recover it too when it exists and
+      // anything is found there (or failed), labelled so the user
+      // knows which wallet the money landed in.
+      if (user.ai) {
+        const aiCreds = { accountId: user.ai.accountId, secret: decryptPrivateKey(user.ai.encSecret) };
+        const aiOutcome = await recoverParkedFunds(aiCreds, candidates, parkedDeps).catch(() => undefined);
+        if (aiOutcome && (aiOutcome.parked.length > 0 || aiOutcome.failures.length > 0)) {
+          lines.push(...recoverLines(aiOutcome, "AI wallet"));
+        }
+      }
+      if (lines.length === 0) {
+        await ctx.reply("Nothing is parked inside the exchange. Everything you own is already in your wallet.");
+      } else {
+        await ctx.reply(lines.join("\n"));
+      }
+    } catch (err: any) {
+      await ctx.reply(`Recover failed: ${err?.message ?? err}`);
+    } finally {
+      await ctx.api.deleteMessage(wait.chat.id, wait.message_id).catch(() => {});
+    }
   });
 
   bot.command("tokens", async (ctx) => {
@@ -729,6 +806,7 @@ export function registerCommands(bot: Bot, nameDeps: NamePromptDeps = defaultNam
         "/buy TOKEN AMOUNT [CURRENCY], buy, TOKEN is a symbol or a contract account id\n" +
         "/sell TOKEN AMOUNT [CURRENCY], sell, AMOUNT is the token amount\n" +
         "/balance, balances\n" +
+        "/recover, pull funds parked inside the exchange back into your wallet\n" +
         "/pnl [TOKEN], shareable PnL win card\n" +
         "/ref, your referral link and earnings\n" +
         "/ref withdraw, cash out referral bonus in NEAR\n" +

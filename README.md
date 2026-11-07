@@ -115,7 +115,7 @@ send.
 
 `/start` `/deposit` `/name [NAME]` `/paycurrency [ID]` `/tokens`
 `/buy TOKEN AMOUNT [CURRENCY]` `/sell TOKEN AMOUNT [CURRENCY]`
-`/balance` `/pnl [TOKEN]` `/ref` `/ref withdraw`
+`/balance` `/recover` `/pnl [TOKEN]` `/ref` `/ref withdraw`
 `/withdraw ACCOUNT [AMOUNT]` `/trades` `/help`
 `/watch` `/unwatch` `/watchlist` `/holdings`
 `/ai setup` `/ai status` `/ai on` `/ai off`
@@ -125,6 +125,30 @@ id pasted directly, as long as the token routes to your pay currency
 across Ref simple pools or DCL pools. For
 /buy, AMOUNT is how much of the pay currency to spend. For /sell,
 AMOUNT is how many tokens to sell.
+
+### Parked funds (`/recover`)
+
+Simple pool trades settle in steps: your tokens are deposited into
+the Ref exchange, swapped inside it, and the output is withdrawn to
+your wallet. If a trade is interrupted between the swap and the
+withdraw, the output stays in your internal exchange balance:
+parked. Parked funds are still yours, held by the exchange under
+your account, but they are not in your wallet, so a wallet balance
+can read zero for a token you actually own. Post swap checks now
+poll for about twenty seconds before calling a trade failed, which
+makes parking rare, and any "swap landed but nothing arrived"
+failure message points here.
+
+`/recover` reads your internal exchange balances for every token
+the bot can know about (pay currencies, wNEAR, your traded tokens
+and trade history, and the watcher discovery set) and withdraws
+each nonzero one back into your wallet, one plain line per token.
+Parked wNEAR is unwrapped to NEAR as it lands, since it almost
+always came from a sell. The AI wallet is checked too. `/balance`
+also runs a light version of the check and adds a line whenever
+something is parked. Recovery is safe to run any time and as often
+as you like: zero balances are skipped, one token failing never
+stops the rest, and with nothing parked it simply says so.
 
 ### Shareable PnL cards (`/pnl`)
 
