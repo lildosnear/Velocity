@@ -88,6 +88,20 @@ export function parseRpcUrls(raw: string | undefined, network: string): string[]
   return urls.length > 0 ? urls : [...fallback];
 }
 
+/**
+ * Parse a NEAR amount typed by a human ("0.002") into yocto, exactly,
+ * with string math only: floats cannot represent these values. Returns
+ * undefined when the string is not a plain non negative decimal with
+ * at most 24 fractional digits. Pure, unit tested.
+ */
+export function parseNearToYocto(raw: string): bigint | undefined {
+  const m = /^(\d+)(?:\.(\d+))?$/.exec(raw.trim());
+  if (!m) return undefined;
+  const frac = m[2] ?? "";
+  if (frac.length > 24) return undefined;
+  return BigInt(m[1]) * 10n ** 24n + BigInt(frac.padEnd(24, "0") || "0");
+}
+
 const network = optional("NEAR_NETWORK", "testnet") as "testnet" | "mainnet";
 const nearRpcUrls = parseRpcUrls(process.env["NEAR_RPC_URL"], network);
 const wnearId = optional("WNEAR_ID", network === "mainnet" ? "wrap.near" : "wrap.testnet");
@@ -144,6 +158,33 @@ export const config = {
   /** Optional bot fee wallet (see scripts/make-fee-wallet). When unset, fees are skipped on chain with a log line and referral credit still accrues in the store. */
   feeAccountId: optional("FEE_ACCOUNT_ID", ""),
   feeAccountSecretEnc: optional("FEE_ACCOUNT_SECRET_ENC", ""),
+  /**
+   * Named wallets: the registrar account that creates top level named
+   * accounts ("testnet" on testnet, "near" on mainnet), and the suffix
+   * every named user wallet carries. Creation is a create_account call
+   * on the registrar signed by a funded creator account (see
+   * scripts/make-creator-wallet). When no creator is configured, named
+   * wallets stay dormant and every user keeps the implicit hex wallet.
+   */
+  registrarId: network === "mainnet" ? "near" : "testnet",
+  nameSuffix: network === "mainnet" ? ".near" : ".testnet",
+  creatorAccountId: optional("CREATOR_ACCOUNT_ID", ""),
+  creatorSecretEnc: optional("CREATOR_SECRET_ENC", ""),
+  /**
+   * Deposit attached to each create_account call, in yocto. Verified
+   * live on testnet on 2026-11-07: the attached deposit becomes the new
+   * account's starting balance in full (the testnet registrar charges
+   * nothing at creation, even a zero deposit lands), so this is a
+   * starter balance for the user's new name, not a burned fee. The
+   * amount is 0.01 NEAR because of a second live finding: a plain
+   * transfer out of a fresh account holding only 0.002 was rejected by
+   * the node with NotEnoughBalance, the operation costed at
+   * 0.00810744245625 NEAR (the node's worst case gas prepayment for
+   * the sender, mostly refunded after execution). At 0.01 the named
+   * account can send immediately, proven live.
+   */
+  nameCreationDepositYocto:
+    parseNearToYocto(optional("NAME_CREATION_DEPOSIT_NEAR", "0.01")) ?? 10n ** 22n,
   slippageBps: Number(optional("SLIPPAGE_BPS", "100")),
   botFeeBps: Number(optional("BOT_FEE_BPS", "100")),
   maxTradeNear: Number(optional("MAX_TRADE_NEAR", "10")),

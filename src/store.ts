@@ -19,11 +19,29 @@ export interface TradedToken {
   decimals: number;
 }
 
+/**
+ * Where a user's named wallet stands. Tracked on the record so the bot
+ * attempts registrar creation at most once per candidate instead of
+ * hammering the registrar on every command. "none" means not attempted
+ * yet (or nothing derivable, with the reason kept). "unavailable" means
+ * the candidate name is taken on chain. "failed" keeps the chain or
+ * validation reason for the last attempt.
+ */
+export interface NameStatus {
+  state: "none" | "created" | "unavailable" | "failed";
+  /** the label that was attempted or created, without the network suffix */
+  candidate?: string;
+  reason?: string;
+}
+
 export interface UserRecord {
   telegramId: number;
   username?: string;
   /** NEAR account id of the hot wallet (implicit hex id, or a named account) */
   accountId: string;
+  /** the original implicit hex wallet, kept when a named account took over as primary */
+  legacyAccountId?: string;
+  nameStatus?: NameStatus;
   /** encrypted NEAR secret key ("ed25519:...") */
   encSecret: EncryptedKey;
   /** which currency the user pays with: "NEAR", "USDC" or "USDT" */

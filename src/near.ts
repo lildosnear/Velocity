@@ -254,6 +254,34 @@ export async function viewFunction<T>(contractId: string, methodName: string, ar
   }
 }
 
+/**
+ * The permission of one access key on an account ("FullAccess", or a
+ * function call permission object), or undefined when the account or
+ * the key does not exist. Used to prove a named account is controlled
+ * by the same key as the implicit wallet it replaced.
+ */
+export async function readAccessKeyPermission(accountId: string, publicKey: string): Promise<unknown> {
+  try {
+    const key = await rpc<{ permission: unknown }>("query", {
+      request_type: "view_access_key",
+      finality: "optimistic",
+      account_id: accountId,
+      public_key: publicKey,
+    });
+    return key.permission;
+  } catch (err: any) {
+    const msg = String(err?.message ?? err);
+    if (
+      msg.includes("does not exist") ||
+      msg.includes("UNKNOWN_ACCOUNT") ||
+      (msg.includes("access key") && msg.includes("not found"))
+    ) {
+      return undefined;
+    }
+    throw err;
+  }
+}
+
 export async function accountExists(accountId: string): Promise<boolean> {
   try {
     await rpc("query", { request_type: "view_account", finality: "optimistic", account_id: accountId });
@@ -340,6 +368,7 @@ export async function ensureContractStorage(
   contractId: string,
   fallbackMinYocto: bigint,
   holderId: string = creds.accountId,
+  gas: bigint = GAS_100_TGAS,
 ): Promise<string | undefined> {
   const existing = await viewFunction<{ total: string } | null>(contractId, "storage_balance_of", { account_id: holderId });
   if (existing && BigInt(existing.total) > 0n) return undefined;
@@ -350,7 +379,7 @@ export async function ensureContractStorage(
     contractId,
     methodName: "storage_deposit",
     args: { account_id: holderId, registration_only: true },
-    gas: GAS_100_TGAS,
+    gas,
     attachedDeposit: min,
   });
   assertSuccess(outcome, `storage_deposit on ${contractId}`);
@@ -362,9 +391,10 @@ export async function ensureFtStorage(
   creds: WalletCreds,
   contractId: string,
   holderId: string = creds.accountId,
+  gas?: bigint,
 ): Promise<string | undefined> {
   // 0.00125 NEAR, the usual NEP 145 minimum, when the contract does not publish bounds.
-  return ensureContractStorage(creds, contractId, 125n * 10n ** 19n, holderId);
+  return ensureContractStorage(creds, contractId, 125n * 10n ** 19n, holderId, gas);
 }
 
 export async function transferFt(
@@ -373,15 +403,16 @@ export async function transferFt(
   toAccountId: string,
   amountRaw: bigint,
   memo?: string,
+  gas: bigint = GAS_100_TGAS,
 ): Promise<string> {
   if (amountRaw <= 0n) throw new Error("Transfer amount must be positive.");
-  await ensureFtStorage(creds, contractId, toAccountId);
+  await ensureFtStorage(creds, contractId, toAccountId, gas);
   const account = await signerAccount(creds);
   const outcome = await account.functionCall({
     contractId,
     methodName: "ft_transfer",
     args: { receiver_id: toAccountId, amount: amountRaw.toString(), memo: memo ?? "Velocity" },
-    gas: GAS_100_TGAS,
+    gas,
     attachedDeposit: ONE_YOCTO,
   });
   assertSuccess(outcome, `ft_transfer on ${contractId}`);
