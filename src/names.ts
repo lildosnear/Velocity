@@ -41,6 +41,13 @@ import {
  * scripts/make-creator-wallet). With no creator configured, named
  * wallets stay dormant: /start behaves exactly as before and /name
  * explains names are not enabled yet. The AI wallet is never named.
+ *
+ * How a name is chosen (Desmond's rule, 2026-11-07): the user is
+ * ASKED for the name they want and types it themselves. The bot
+ * never derives a name from the Telegram username or anything else,
+ * and never creates a subaccount of the creator or project account:
+ * every named wallet is a top level NAME + suffix account created
+ * through the registrar, exactly like the hex wallet it replaces.
  */
 
 /** Shortest label the bot will attempt. NEAR ids need at least 2 characters overall; 3 character labels are proven creatable on the testnet registrar. */
@@ -52,12 +59,13 @@ export function maxLabelLength(): number {
 }
 
 /**
- * Turn a Telegram username (or any typed string) into a tidy NEAR name
- * label: lowercase, every run of characters NEAR cannot use (including
- * underscores, dots and spaces) collapses into a single dash, and no
- * leading, trailing or doubled separators survive. Returns undefined
- * when nothing usable remains or the result is out of length bounds.
- * Pure, unit tested.
+ * Turn a typed name into a tidy NEAR name label: lowercase, every run
+ * of characters NEAR cannot use (including underscores, dots and
+ * spaces) collapses into a single dash, and no leading, trailing or
+ * doubled separators survive. Returns undefined when nothing usable
+ * remains or the result is out of length bounds. Pure, unit tested.
+ * Callers compare the result against what the user actually typed:
+ * a name that needed cleaning is shown back, never silently claimed.
  */
 export function sanitizeLabel(raw: string | undefined | null): string | undefined {
   if (!raw) return undefined;
@@ -77,11 +85,6 @@ export function isImplicitId(accountId: string): boolean {
 
 export function fullNameId(label: string): string {
   return `${label}${config.nameSuffix}`;
-}
-
-/** The label the bot would try for this user, derived from their Telegram username. */
-export function candidateLabelFor(user: UserRecord): string | undefined {
-  return sanitizeLabel(user.username);
 }
 
 export interface CreatorWallet {
@@ -282,23 +285,121 @@ export async function createNamedAccountFor(user: UserRecord, label: string): Pr
 }
 
 /**
- * The /start path for a brand new user: derive the candidate from the
- * Telegram username and try to create it, recording why not when it
- * cannot happen. Existing users are never attempted here; their one
- * route in is /name, so the registrar is only touched on purpose.
+ * The ask the bot sends when it sets the name prompt (at /start for a
+ * brand new user, and from /name with no argument). One wording for
+ * both places so the flow reads the same wherever it starts.
  */
-export async function attemptNameForNewUser(user: UserRecord): Promise<NameAttemptResult> {
-  if (!namesEnabled()) return { state: "disabled" };
-  const candidate = candidateLabelFor(user);
-  if (!candidate) {
-    user.nameStatus = {
-      state: "none",
-      reason: user.username
-        ? "your Telegram username does not reduce to a usable NEAR name"
-        : "you have no Telegram username to derive a name from",
-    };
+export function namePromptAskText(user: UserRecord): string {
+  return (
+    `What wallet name do you want? Reply with just the name part and I will create it for you: ` +
+    `for example, "myname" gives you ${fullNameId("myname")}.\n\n` +
+    `Your wallet today is ${user.accountId}, and it keeps working whatever you decide. ` +
+    `Send skip, or any command, to leave it as it is for now.`
+  );
+}
+
+/**
+ * The name prompt lifecycle, with the naming service behind an
+ * interface so handler tests can stub it. The router (commands.ts)
+ * feeds every text message through handlePendingNameText while a
+ * user's pendingNamePrompt flag is set:
+ * - a message starting with "/" clears the prompt and is NOT
+ *   consumed: the command runs normally;
+ * - the literal reply "skip" (any case) clears the prompt;
+ * - any other plain text is the name the user wants, and runs the
+ *   claim flow.
+ * The prompt has no expiry; it waits for the next message.
+ */
+export interface NamePromptDeps {
+  /** naming is configured on this bot (a funded creator is set) */
+  enabled: () => boolean;
+  /** the user already holds a named account as their primary */
+  isNamed: (user: UserRecord) => boolean;
+  /** create the named account for a validated label, registrar flow */
+  claim: (user: UserRecord, label: string) => Promise<NameAttemptResult>;
+}
+
+export const defaultNamePromptDeps: NamePromptDeps = {
+  enabled: namesEnabled,
+  isNamed: (user) => !isImplicitId(user.accountId),
+  claim: createNamedAccountFor,
+};
+
+export type NamePromptReply =
+  /** not consumed: no prompt was pending, or a command arrived (prompt cleared) and the command must run */
+  | { kind: "pass" }
+  /** consumed: the user replied skip, the prompt is cleared */
+  | { kind: "skipped" }
+  /** consumed: the name was created and is now the user's primary account */
+  | { kind: "created"; result: NameAttemptResult }
+  /** consumed: that name is taken; the prompt stays open for another try */
+  | { kind: "taken"; namedId: string }
+  /** consumed: the typed text needs cleaning; the cleaned form is shown and nothing is claimed yet; prompt stays open */
+  | { kind: "needs-cleaning"; cleaned: string; namedId: string }
+  /** consumed: the typed text can never be a NEAR name; the prompt stays open */
+  | { kind: "unusable" }
+  /** consumed: creation failed on chain; the prompt stays open */
+  | { kind: "failed"; reason: string }
+  /** consumed: naming was switched off after the prompt was set; the prompt is cleared */
+  | { kind: "disabled" }
+  /** consumed: the user already has a named account; the prompt is cleared */
+  | { kind: "already-named"; namedId: string };
+
+function clearPrompt(user: UserRecord): void {
+  if (user.pendingNamePrompt) {
+    user.pendingNamePrompt = false;
     store.saveUser(user);
-    return { state: "none", reason: user.nameStatus.reason };
   }
-  return createNamedAccountFor(user, candidate);
+}
+
+export async function handlePendingNameText(
+  user: UserRecord,
+  text: string,
+  deps: NamePromptDeps = defaultNamePromptDeps,
+): Promise<NamePromptReply> {
+  if (!user.pendingNamePrompt) return { kind: "pass" };
+  const trimmed = text.trim();
+  // A command always wins: clear the prompt and let the router run it.
+  if (trimmed.startsWith("/")) {
+    clearPrompt(user);
+    return { kind: "pass" };
+  }
+  if (trimmed.toLowerCase() === "skip") {
+    clearPrompt(user);
+    return { kind: "skipped" };
+  }
+  if (!deps.enabled()) {
+    clearPrompt(user);
+    return { kind: "disabled" };
+  }
+  if (deps.isNamed(user)) {
+    clearPrompt(user);
+    return { kind: "already-named", namedId: user.accountId };
+  }
+
+  const typed = trimmed.toLowerCase();
+  const cleaned = sanitizeLabel(typed);
+  if (!cleaned) return { kind: "unusable" };
+  if (cleaned !== typed) {
+    // Never silently rewrite a name and claim it: show the cleaned
+    // form and let the user send that, or a different name.
+    return { kind: "needs-cleaning", cleaned, namedId: fullNameId(cleaned) };
+  }
+  let result: NameAttemptResult;
+  try {
+    result = await deps.claim(user, cleaned);
+  } catch (err: any) {
+    return { kind: "failed", reason: String(err?.message ?? err).slice(0, 200) };
+  }
+  if (result.state === "created") {
+    clearPrompt(user);
+    return { kind: "created", result };
+  }
+  if (result.state === "unavailable") return { kind: "taken", namedId: fullNameId(cleaned) };
+  if (result.state === "disabled") {
+    clearPrompt(user);
+    return { kind: "disabled" };
+  }
+  if (result.state === "invalid") return { kind: "unusable" };
+  return { kind: "failed", reason: result.reason ?? "unknown error" };
 }

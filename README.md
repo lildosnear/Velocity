@@ -249,22 +249,29 @@ becomes the primary account the bot shows and uses, and the hex wallet
 stays on the user's record as their legacy address. The AI wallet is
 never named.
 
-How a name arrives:
+How a name arrives: the user is asked for the name they want, and
+they type it themselves. The bot never derives a name from the
+Telegram username or anything else, and a name is always a top level
+NAME.testnet or NAME.near account created through the registrar,
+never a subaccount of the creator or project account.
 
-- At /start, a brand new user's name is derived from their Telegram
-  username: lowercased, with every run of characters NEAR cannot use
-  (underscores included) collapsed into a single dash. King_1504
-  becomes king-1504.testnet. If the name is free, it is created on the
-  spot. If it is taken or creation fails, /start still completes with
-  the hex wallet and says why, in plain words.
-- /name with no argument shows your current name, or your candidate
-  and its status. /name <name> claims a custom name instead. A name
-  typed with characters NEAR cannot use is not silently changed: the
-  bot shows the cleaned up version and asks you to run it again with
-  that, so the name you get is always the name you saw.
+- At /start, the welcome message asks a brand new user to reply with
+  the wallet name they want, and a pending prompt is set on their
+  record: their next plain text reply is treated as the name and
+  claimed. Sending any command, or the reply "skip", clears the
+  prompt instead. The prompt has no expiry; it simply waits for the
+  next message. Returning users are not prompted at /start (no
+  surprise interception), just pointed at /name.
+- /name with no argument asks the same question and sets the same
+  prompt. /name <name> claims that name directly in one step.
+- A reply that is already taken is answered plainly and the prompt
+  stays open for another try. A reply typed with characters NEAR
+  cannot use is not silently changed: the bot shows the cleaned up
+  version (King_1504 would become king-1504.testnet) and claims
+  nothing until the user sends that name, so the name you get is
+  always the name you saw.
 - The outcome of every attempt is recorded on the user record
-  (created, unavailable, failed with the reason), so the bot never
-  hammers the registrar twice for the same candidate.
+  (created, unavailable, failed with the reason).
 
 When a name is created for a user whose hex wallet already holds
 funds, the bot sweeps the legacy wallet: every recorded token balance
@@ -349,27 +356,28 @@ deposit, swap and withdraw flow; and the exchange requires each
 account to hold a small NEAR storage balance inside it (the bot tops
 it up to 0.01 NEAR once, see ensureExchangeAccount in src/market.ts).
 
-Named wallets have their own proof: `npm run named-proof`. The run
-on 2026-11-07, with the swap proof wallet as the configured creator,
-passed both parts on testnet. Part A, a fresh user: the username
-Velocity_Proof_62355 derived the label velocity-proof-62355, and
-create_account on the testnet registrar created
-velocity-proof-62355.testnet with the wallet's own public key
-(transaction JcSgMkN5LCeJNq1dhRYNgHjz1xFuygxJa5RiG8jtw9i). The
-account's access key reads back as that exact public key with
-FullAccess permission, the store record shows the name as primary
-with the hex wallet kept as legacy, and a transfer of 0.0005 NEAR
-signed by the named account landed
-(J7NFS3Jr9237kTBddyPkvtL7TrzDsTKxagbBpFqtP1T4). Part B, the sweep:
-a hex wallet funded with 0.05 NEAR
-(5RdXSrURipvNHro32V3CXh3WExgbHGYyMmdn32qYjhtm) and 0.01 wNEAR
-(3CNQ4QfeTLJNADtBK4DXErHbwMeNsbfMEYnKhTVJCBhc) got the name
-sweep-proof-62355.testnet (creation
-FaBh8iB6AgpCPrNZPXuL4W9KFzbogJseHaBbDUbUw4k6); the sweep moved the
-0.01 wNEAR (39GBUg5Fh1JcxALGC6m8Kehwy8s1DUz9zPk9HrYbg13c) and
-0.0453 NEAR (9fjThuvFn5FXQvBx6M2D4u9AtrX26ELetNxQgKSoemzZ) to the
-name, leaving only the 0.003 NEAR gas reserve (0.002955 after gas)
-on the old address, which the sweep report states openly.
+Named wallets have their own proof: `npm run named-proof`. The
+latest run on 2026-11-07, with the swap proof wallet as the
+configured creator, passed both parts on testnet. Part A, a fresh
+user claiming a name they typed: create_account on the testnet
+registrar created velocity-proof-87179.testnet with the wallet's own
+public key (transaction
+GHiqzjUpV2ydiDvFLFChqbWTojhwfBVFC4Zm3U2YUZwh). The account's access
+key reads back as that exact public key with FullAccess permission,
+the store record shows the name as primary with the hex wallet kept
+as legacy, and a transfer of 0.0005 NEAR signed by the named account
+landed (3bb7M9ds5XXa1zLp6UaG8vWnknnVTvnLGG3AavcaQUQV). Part B, the
+sweep: a hex wallet funded with 0.05 NEAR
+(Gfu6GmaKq9o5nBcqzPqRsXy7XDzBtYnjcYaeuMtZnvAX) and 0.01 wNEAR
+(9Km17wo3YZsWm9XzVEQyFAbmowWozhLoAxhNpsaZe2qM) got the name
+sweep-proof-87179.testnet (creation
+9CNxsMnZoos74wyKiY1nVGrknr5hjRHGjgtLw9bBBtm8); the sweep moved the
+full 0.01 wNEAR (DkRjhbL1CsYfgQRxwGNRmXh4mn5SDyifvEiDMkVucyZ2) and
+0.0286 NEAR (AMi87x2k9fLQezBKwfaKWqbhhSbGUmMQm64fySHarknn) to the
+name, and reported 0.018455 NEAR still on the old address openly,
+with the address, as the best effort sweep is designed to do (the
+NEAR leg reads the balance once, and that read can land while the
+token sweep's calls are still settling).
 
 ## MAINNET
 
@@ -482,10 +490,12 @@ live contract and real transaction traces:
    from `npm run make-fee-wallet` also works.) Fund it small: it only
    pays referral bonuses out.
 5. Creator wallet: set CREATOR_ACCOUNT_ID=velocitybot.near and put
-   its encrypted key in CREATOR_SECRET_ENC the same way, so user
-   names are created by the project account itself. Fund it for the
-   names you expect: each creation attaches 0.01 NEAR that lands in
-   the user's new account.
+   its encrypted key in CREATOR_SECRET_ENC the same way, so the
+   project account signs the registrar calls that create each user's
+   own top level .near name (a user's name is never a subaccount of
+   the project account; the project account only signs and pays).
+   Fund it for the names you expect: each creation attaches 0.01
+   NEAR that lands in the user's new account.
 6. Run `npm run smoke`. On mainnet config it must print the mainnet
    RPC list, a live block height, 9014 simple pools, thousands of
    DCL pools, and two mainnet quotes (wNEAR to USDC and wNEAR to
@@ -539,15 +549,19 @@ unproven until the first real trades land:
 
 ## Tests
 
-`npm test` runs the unit suite, 73 tests: referral fee math (discount
+`npm test` runs the unit suite, 85 tests: referral fee math (discount
 stops at trade 10, referrer credit continues for life, AI trades
 excluded), PnL tier selection and average cost basis, raw amount
 conversion, slippage math, the instant swap message format, DCL pool
 id and swap message building, DCL route finding (best fee tier, two
 hop chaining through wNEAR, zero liquidity pools skipped), best
 route selection across simple and DCL pools, RPC endpoint parsing and
-failover, the named wallet rules (username sanitizing edge cases,
-NEAR amount parsing, creator configuration defaults), and the
+failover, the named wallet rules (typed name cleaning edge cases,
+created ids always top level, NEAR amount parsing, creator
+configuration defaults), the name prompt lifecycle at handler level
+(prompt set at /start and by /name only when configured, a plain
+reply claims, a command or "skip" clears it, a taken or unclean name
+keeps it open and claims nothing), and the
 mainnet readiness rules (per network contract selection, scan bounds
 and per trade cap defaults, the TRADING_ENABLED switch refusing buys
 and sells while paused, and the PnL network pill and caption wording

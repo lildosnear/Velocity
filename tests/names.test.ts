@@ -3,7 +3,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { config, parseNearToYocto } from "../src/config";
 import {
-  candidateLabelFor,
   fullNameId,
   getCreatorWallet,
   isImplicitId,
@@ -11,9 +10,8 @@ import {
   namesEnabled,
   sanitizeLabel,
 } from "../src/names";
-import type { UserRecord } from "../src/store";
 
-test("sanitize keeps a plain username as is, lowercased", () => {
+test("sanitize keeps a plain typed name as is, lowercased", () => {
   assert.equal(sanitizeLabel("swifttrader"), "swifttrader");
   assert.equal(sanitizeLabel("DesmondUzor"), "desmonduzor");
   assert.equal(sanitizeLabel("trader123"), "trader123");
@@ -50,13 +48,21 @@ test("sanitize enforces the NEAR 64 character account id limit", () => {
   assert.equal(sanitizeLabel("a".repeat(max + 1)), undefined);
 });
 
-test("candidate derivation uses the telegram username, and full ids carry the network suffix", () => {
-  const user = { username: "King_1504" } as UserRecord;
-  assert.equal(candidateLabelFor(user), "king-1504");
-  assert.equal(candidateLabelFor({} as UserRecord), undefined);
+test("full ids are top level names: the label plus the network suffix, never a subaccount of anything", () => {
   assert.equal(fullNameId("king-1504"), `king-1504${config.nameSuffix}`);
   assert.equal(config.registrarId, "testnet");
   assert.equal(config.nameSuffix, ".testnet");
+  // The suffix is a bare top level suffix (one dot, at the end): a
+  // created id is exactly <label>.testnet here, <label>.near on
+  // mainnet. It can never carry the creator or project account as a
+  // parent, because fullNameId is the only id the claim flow builds.
+  assert.equal(config.nameSuffix.split(".").length, 2, "suffix is a single top level suffix");
+  for (const label of ["king-1504", "a", "velocity-proof-1"]) {
+    const id = fullNameId(label);
+    assert.equal(id, `${label}.testnet`);
+    assert.equal(id.split(".").length, 2, "created id has exactly one dot: no parent account in it");
+    if (config.creatorAccountId) assert.ok(!id.includes(config.creatorAccountId));
+  }
 });
 
 test("isImplicitId only matches 64 character hex ids", () => {

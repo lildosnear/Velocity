@@ -20,14 +20,14 @@ import {
 } from "./market";
 import { getTokenPriceNear, tokenDecimals } from "./prices";
 import {
-  attemptNameForNewUser,
-  candidateLabelFor,
-  createNamedAccountFor,
+  defaultNamePromptDeps,
   fullNameId,
-  isImplicitId,
+  handlePendingNameText,
   maxLabelLength,
-  namesEnabled,
+  namePromptAskText,
   sanitizeLabel,
+  type NameAttemptResult,
+  type NamePromptDeps,
 } from "./names";
 import { aiActive } from "./copy";
 import { alertBuyAmountNear, alertSellAmountRaw, getHoldings } from "./watcher";
@@ -52,7 +52,6 @@ async function getOrCreateUser(ctx: any, refPayload?: string) {
     }
     user = {
       telegramId,
-      username: ctx.from.username,
       accountId: wallet.accountId,
       encSecret: encryptPrivateKey(wallet.secret),
       tokens: {},
@@ -64,12 +63,6 @@ async function getOrCreateUser(ctx: any, refPayload?: string) {
   }
   if (!user.tokens) user.tokens = {};
   if (!user.payCurrency) user.payCurrency = config.defaultPayCurrency;
-  // Keep the Telegram username current: the named wallet candidate is
-  // derived from it, and usernames change.
-  if (ctx.from.username && ctx.from.username !== user.username) {
-    user.username = ctx.from.username;
-    store.saveUser(user);
-  }
   return user;
 }
 
@@ -85,25 +78,95 @@ function userToken(userTokens: Record<string, TradedToken>, ref: string): Traded
   return Object.values(userTokens).find((t) => t.id === lower || t.symbol.toLowerCase() === lower);
 }
 
-export function registerCommands(bot: Bot) {
+/** The reply lines for a name that was just created, shared by /name and the name prompt reply. */
+function nameCreatedLines(user: { legacyAccountId?: string }, result: NameAttemptResult): string[] {
+  const lines = [
+    `Your wallet name is now ${result.namedId}.`,
+    "It is the same wallet with the same key, just a human name. Use it as your deposit address from now on.",
+  ];
+  if (result.sweptNear && result.sweptNear > 0) lines.push(`Moved ${fmt(result.sweptNear)} NEAR from your old address to the name.`);
+  for (const line of result.leftovers ?? []) lines.push(line);
+  if (user.legacyAccountId) lines.push(`Your old address ${user.legacyAccountId} still belongs to you. Anything sent there stays yours.`);
+  return lines;
+}
+
+export function registerCommands(bot: Bot, nameDeps: NamePromptDeps = defaultNamePromptDeps) {
+  // Wallet name prompt interception, registered before every command
+  // so it sees text messages first. While a user's pendingNamePrompt
+  // flag is set (by /start for a brand new user, or by /name with no
+  // argument), their next plain text message IS the wallet name they
+  // want. A command clears the prompt and runs normally; the reply
+  // "skip" clears it too. See handlePendingNameText in names.ts.
+  bot.on("message:text", async (ctx, next) => {
+    const text = ctx.message?.text;
+    if (!text || !ctx.from) return next();
+    const user = store.getUser(ctx.from.id);
+    if (!user?.pendingNamePrompt) return next();
+    const reply = await handlePendingNameText(user, text, nameDeps);
+    switch (reply.kind) {
+      case "pass":
+        return next();
+      case "skipped":
+        await ctx.reply(
+          `No problem, your wallet stays as ${user.accountId} for now. Run /name any time you want to claim a name.`,
+        );
+        return;
+      case "already-named":
+        await ctx.reply(`Your wallet name is already ${reply.namedId}.`);
+        return;
+      case "disabled":
+        await ctx.reply(
+          "Named wallets just got disabled on this bot (no creator account configured), so nothing was created. Your wallet is unchanged.",
+        );
+        return;
+      case "created":
+        await ctx.reply(nameCreatedLines(user, reply.result).join("\n\n"));
+        return;
+      case "taken":
+        await ctx.reply(
+          `${reply.namedId} is already taken on chain. Reply with a different name, or send skip to keep your current address.`,
+        );
+        return;
+      case "needs-cleaning":
+        await ctx.reply(
+          `NEAR names cannot use those characters as typed. Cleaned up, your name would be: ${reply.namedId}\nReply with ${reply.cleaned} if that is the one you want, or send a different name.`,
+        );
+        return;
+      case "unusable":
+        await ctx.reply(
+          `That name cannot be used. NEAR names are lowercase letters and numbers separated by single dashes, between ${2} and ${maxLabelLength()} characters for the name part. Reply with another name, or send skip to keep your current address.`,
+        );
+        return;
+      case "failed":
+        await ctx.reply(
+          `Creating that name failed: ${reply.reason}\nReply with another name to try again, or send skip to keep your current address.`,
+        );
+        return;
+    }
+  });
+
   bot.command("start", async (ctx) => {
     const [, payload] = (ctx.message?.text ?? "").split(/\s+/);
     const isNewUser = ctx.from ? !store.getUser(ctx.from.id) : false;
     const user = await getOrCreateUser(ctx, payload);
-    // Brand new users get a named wallet attempt right away, derived
-    // from their Telegram username. Failure never breaks /start: the
-    // hex wallet below is always a working wallet.
+    // Named wallets: the user is ASKED for the name they want, never
+    // given one derived from anything. A brand new user gets the ask
+    // right here and the prompt is set, so their next plain reply is
+    // treated as the name (any command, or "skip", cancels). A
+    // returning user who is still nameless just gets a pointer at
+    // /name; no prompt is set, so nothing intercepts their next
+    // message by surprise.
     let nameNote = "";
-    if (isNewUser) {
-      const attempt = await attemptNameForNewUser(user).catch(() => ({ state: "failed" as const, reason: "the name check hit a network error" }));
-      if (attempt.state === "created") {
-        nameNote = "\n\nThat account is a named wallet, created for you from your Telegram username. It is controlled by the same key as your wallet, there is just no long hex string to copy.";
-      } else if (attempt.state === "unavailable") {
-        nameNote = `\n\nThe name from your Telegram username (${attempt.reason ?? "the derived name"}) is already taken on chain, so your wallet stays as the address above for now. Pick your own any time with /name <name>.`;
-      } else if (attempt.state === "failed") {
-        nameNote = `\n\nI could not create a named wallet for you (${attempt.reason ?? "unknown error"}), so your wallet is the address above. You can try again any time with /name.`;
-      } else if (attempt.state === "none") {
-        nameNote = "\n\nTip: run /name <name> to give this wallet a human name instead of the long address above.";
+    if (nameDeps.enabled() && !nameDeps.isNamed(user)) {
+      if (isNewUser) {
+        user.pendingNamePrompt = true;
+        store.saveUser(user);
+        nameNote =
+          "\n\nYou can also give this wallet a human name instead of the long address above. " +
+          `Reply with the wallet name you want (for example "myname" gives you ${fullNameId("myname")}), ` +
+          "or send any command to skip for now. You can claim a name any time with /name.";
+      } else {
+        nameNote = "\n\nTip: run /name to give this wallet a human name instead of the long address above.";
       }
     }
     const net = config.network === "mainnet" ? "NEAR mainnet" : "NEAR testnet";
@@ -122,7 +185,7 @@ export function registerCommands(bot: Bot) {
         nameNote +
         "\n\n" +
         "Commands:\n" +
-        "/name, your wallet name (or pick one)\n" +
+        "/name, claim or show your wallet name\n" +
         "/tokens, list tradable tokens\n" +
         "/buy TOKEN AMOUNT [CURRENCY], buy (e.g. /buy wNEAR 0.5, or paste a token contract id)\n" +
         "/sell TOKEN AMOUNT [CURRENCY], sell tokens\n" +
@@ -163,7 +226,7 @@ export function registerCommands(bot: Bot) {
     const user = await getOrCreateUser(ctx);
     const [, arg] = (ctx.message?.text ?? "").split(/\s+/);
 
-    if (!isImplicitId(user.accountId)) {
+    if (nameDeps.isNamed(user)) {
       const lines = [`Your wallet name is ${user.accountId}. It is your deposit address and it is controlled by the same key as your wallet.`];
       if (user.legacyAccountId && user.legacyAccountId !== user.accountId) {
         lines.push(`Your original address ${user.legacyAccountId} still belongs to you too. Anything sent there stays yours.`);
@@ -172,7 +235,7 @@ export function registerCommands(bot: Bot) {
       return;
     }
 
-    if (!namesEnabled()) {
+    if (!nameDeps.enabled()) {
       await ctx.reply(
         "Named wallets are not enabled on this bot yet. The operator has not configured a creator account, so every wallet stays as its long address for now. Nothing about your wallet changes: it works exactly as it is.",
       );
@@ -180,21 +243,19 @@ export function registerCommands(bot: Bot) {
     }
 
     if (!arg) {
-      const candidate = candidateLabelFor(user);
+      // No name given: ask, and set the prompt so the user's next
+      // plain reply is the name they want. /name <name> still claims
+      // directly in one step.
+      user.pendingNamePrompt = true;
+      store.saveUser(user);
       const st = user.nameStatus;
-      const lines: string[] = [];
-      if (candidate) {
-        lines.push(`The name from your Telegram username would be: ${fullNameId(candidate)}`);
-        if (st?.state === "unavailable") lines.push("That name is already taken on chain. Pick a different one with /name <name>.");
-        else if (st?.state === "failed") lines.push(`The last attempt to create it failed: ${st.reason ?? "unknown error"}\nRun /name ${candidate} to try again, or /name <name> to pick a different one.`);
-        else lines.push(`Run /name ${candidate} to claim it, or /name <name> to pick a different one.`);
-      } else {
-        lines.push(
-          `I cannot derive a name from your Telegram username${st?.reason ? ` (${st.reason})` : ""}. Pick one yourself with /name <name>, for example /name swift-trader.`,
-        );
-      }
-      lines.push(`Your wallet today is the address ${user.accountId}, and it keeps working whatever you decide.`);
-      await ctx.reply(lines.join("\n\n"));
+      const note =
+        st?.state === "failed"
+          ? `\n\n(Your last name attempt failed: ${st.reason ?? "unknown error"}. You can try that name again or pick a different one.)`
+          : st?.state === "unavailable" && st.candidate
+            ? `\n\n(The last name you asked for, ${fullNameId(st.candidate)}, was already taken. Pick a different one.)`
+            : "";
+      await ctx.reply(namePromptAskText(user) + note);
       return;
     }
 
@@ -214,16 +275,9 @@ export function registerCommands(bot: Bot) {
 
     const wait = await ctx.reply(`Creating ${fullNameId(cleaned)}...`);
     void wait;
-    const result = await createNamedAccountFor(user, cleaned);
+    const result = await nameDeps.claim(user, cleaned);
     if (result.state === "created") {
-      const lines = [
-        `Your wallet name is now ${result.namedId}.`,
-        "It is the same wallet with the same key, just a human name. Use it as your deposit address from now on.",
-      ];
-      if (result.sweptNear && result.sweptNear > 0) lines.push(`Moved ${fmt(result.sweptNear)} NEAR from your old address to the name.`);
-      for (const line of result.leftovers ?? []) lines.push(line);
-      if (user.legacyAccountId) lines.push(`Your old address ${user.legacyAccountId} still belongs to you. Anything sent there stays yours.`);
-      await ctx.reply(lines.join("\n\n"));
+      await ctx.reply(nameCreatedLines(user, result).join("\n\n"));
       return;
     }
     if (result.state === "unavailable") {
@@ -669,7 +723,7 @@ export function registerCommands(bot: Bot) {
     await ctx.reply(
       "/start, create your trading wallet\n" +
         "/deposit, your deposit account\n" +
-        "/name [NAME], your wallet name, or claim one\n" +
+        "/name [NAME], your wallet name, or claim one; without NAME it asks you to reply with the name you want\n" +
         "/paycurrency [ID], show or change pay currency (NEAR/USDC/USDT)\n" +
         "/tokens, list known tokens and pool prices\n" +
         "/buy TOKEN AMOUNT [CURRENCY], buy, TOKEN is a symbol or a contract account id\n" +

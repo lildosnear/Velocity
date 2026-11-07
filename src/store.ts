@@ -21,12 +21,12 @@ export interface TradedToken {
 }
 
 /**
- * Where a user's named wallet stands. Tracked on the record so the bot
- * attempts registrar creation at most once per candidate instead of
- * hammering the registrar on every command. "none" means not attempted
- * yet (or nothing derivable, with the reason kept). "unavailable" means
- * the candidate name is taken on chain. "failed" keeps the chain or
- * validation reason for the last attempt.
+ * Where a user's named wallet stands: the outcome of the last name the
+ * USER asked for. Names are only ever the ones a user typed (at the
+ * /start prompt, the /name prompt, or /name <name>); the bot never
+ * derives a name from anything. "none" means no attempt has been made
+ * yet. "unavailable" means the asked for name is taken on chain.
+ * "failed" keeps the chain or validation reason for the last attempt.
  */
 export interface NameStatus {
   state: "none" | "created" | "unavailable" | "failed";
@@ -37,12 +37,19 @@ export interface NameStatus {
 
 export interface UserRecord {
   telegramId: number;
-  username?: string;
   /** NEAR account id of the hot wallet (implicit hex id, or a named account) */
   accountId: string;
   /** the original implicit hex wallet, kept when a named account took over as primary */
   legacyAccountId?: string;
   nameStatus?: NameStatus;
+  /**
+   * True while the bot is waiting for this user to reply with the
+   * wallet name they want (set by /start for brand new users and by
+   * /name with no argument). While set, the router treats the user's
+   * next plain text message as the name; any command, or the reply
+   * "skip", clears it. It has no expiry: it simply waits.
+   */
+  pendingNamePrompt?: boolean;
   /** encrypted NEAR secret key ("ed25519:...") */
   encSecret: EncryptedKey;
   /** which currency the user pays with: "NEAR", "USDC" or "USDT" */
