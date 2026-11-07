@@ -96,13 +96,35 @@ export interface PendingAlertToken {
 }
 
 /**
- * One trader alert that carries Buy and Ignore buttons, kept so a
- * button tap can be resolved without putting token account ids in the
- * callback data (Telegram caps callback data at 64 bytes and NEAR ids
- * can be long). The record is per receiving user: every watcher gets
- * their own alert message, their own record and their own buttons, and
- * one user acting on theirs never touches another user's copy. Records
- * expire one hour after the alert was sent.
+ * One actionable leg of a trader alert: a token the trader bought or
+ * sold, in the order the legs appear in the alert text. Sell legs
+ * carry the fraction of their own holding the trader sold, derived
+ * from the watcher's balance diff at alert time, so a Sell tap can
+ * mirror the same fraction of the receiving user's holding.
+ */
+export interface PendingAlertLeg {
+  side: "buy" | "sell";
+  /** fungible token contract account id */
+  id: string;
+  symbol: string;
+  /**
+   * Sell legs only: the fraction of the trader's holding they sold,
+   * between 0 and 1. Undefined when the fraction could not be derived,
+   * which a Sell tap treats as selling the user's full holding.
+   */
+  sellFraction?: number;
+}
+
+/**
+ * One trader alert that carries Buy, Sell and Ignore buttons, kept so
+ * a button tap can be resolved without putting token account ids in
+ * the callback data (Telegram caps callback data at 64 bytes and NEAR
+ * ids can be long). The record is per receiving user: every watcher
+ * gets their own alert message, their own record and their own
+ * buttons, and one user acting on theirs never touches another user's
+ * copy. Records expire one hour after the alert was sent. Records
+ * written before legs existed carry no legs and are treated as
+ * expired by the tap handlers.
  */
 export interface PendingAlert {
   /** short random id, the only thing the callback data carries */
@@ -113,6 +135,8 @@ export interface PendingAlert {
   traderAccountId: string;
   /** tokens the trader bought in this alert, in alert order (button order) */
   tokens: PendingAlertToken[];
+  /** every actionable leg of the alert (buys and sells), in alert order */
+  legs?: PendingAlertLeg[];
   /** the full alert text as sent, so taps can append a line to it */
   text: string;
   /** where the alert message lives, filled in once Telegram confirms the send */

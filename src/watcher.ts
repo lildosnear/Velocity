@@ -3,6 +3,7 @@ import { config } from "./config";
 import { readFtBalanceRaw } from "./near";
 import {
   type PendingAlert,
+  type PendingAlertLeg,
   type PendingAlertToken,
   type TradedToken,
   type UserRecord,
@@ -31,9 +32,12 @@ import { watchTokenSet } from "./discovery";
  * is left out of the text; a tick where only wNEAR moved (a wrap, an
  * unwrap, a plain transfer) still alerts on its own. The copy engine
  * is unaffected: it keeps consuming the per token diffs one by one.
- * Each alert also carries Buy and Ignore buttons for its receiver
- * only (see buildAlertKeyboard and the pending alert records in the
- * store); the taps are handled in commands.ts.
+ * Each alert also carries Buy, Sell and Ignore buttons for its
+ * receiver only (see buildAlertKeyboard and the pending alert
+ * records in the store); the taps are handled in commands.ts. A Sell
+ * button mirrors the trader's move proportionally: it sells the
+ * same fraction of the receiver's own holding that the trader sold
+ * of theirs.
  *
  * Honest limits:
  * - We cannot distinguish a buy from a plain transfer in (or a sell from
@@ -99,6 +103,8 @@ export interface TraderAlertDiff {
   token: TradedToken;
   side: "buy" | "sell";
   amountTokens: number;
+  /** balance before the change, when known (watcher events carry it) */
+  beforeTokens?: number;
 }
 
 /** Alert amounts: two decimals with thousands separators, e.g. 2,889.42. */
@@ -156,6 +162,9 @@ export function composeTraderAlert(
 /** At most this many Buy buttons ride on one alert. */
 export const MAX_ALERT_BUY_BUTTONS = 3;
 
+/** At most this many action buttons (Buy and Sell rows together) ride on one alert. */
+export const MAX_ALERT_ACTION_BUTTONS = 3;
+
 /**
  * The tokens an alert offers Buy buttons for: the bought side of the
  * shown diffs, deduplicated, in alert order, capped at
@@ -178,18 +187,82 @@ export function alertBoughtTokens(
   return out;
 }
 
+/** Clamp a fraction into [0, 1]; anything not a finite number reads as a full exit. */
+export function clampSellFraction(fraction: number | undefined): number {
+  if (fraction == null || !Number.isFinite(fraction)) return 1;
+  return Math.min(1, Math.max(0, fraction));
+}
+
 /**
- * The keyboard under a trader alert: one row per bought token with a
- * "Buy <SYMBOL>" button, then a single "Ignore" row at the bottom. An
- * alert with no buy leg gets the Ignore row only. Callback data
- * carries only the pending alert's short id (plus the token index for
- * buys), never a token account id, so it stays far under Telegram's
- * 64 byte callback cap. Pure, unit tested.
+ * The fraction of their own holding a trader sold, from the watcher's
+ * balance diff: sold amount over the balance before the move, clamped
+ * between 0 and 1. When the balance before is unknown the fraction
+ * cannot be derived and this returns 1, a full exit, which is also
+ * what a Sell tap falls back to. Pure.
  */
-export function buildAlertKeyboard(alertId: string, tokens: PendingAlertToken[]): InlineKeyboard {
+export function sellFractionOf(diff: TraderAlertDiff): number {
+  const before = diff.beforeTokens;
+  if (before == null || !(before > 0)) return 1;
+  return clampSellFraction(diff.amountTokens / before);
+}
+
+/**
+ * Every actionable leg of an alert, in the order the legs appear in
+ * the alert text: sells first (as the composer states them), then
+ * buys, deduplicated per side and token, capped at
+ * MAX_ALERT_ACTION_BUTTONS rows in total. Sell legs carry the
+ * fraction of their holding the trader sold. Pure.
+ */
+export function alertLegs(diffs: TraderAlertDiff[], wnearId: string): PendingAlertLeg[] {
+  const shown = shownDiffs(diffs, wnearId);
+  const ordered = [
+    ...shown.filter((d) => d.side === "sell"),
+    ...shown.filter((d) => d.side === "buy"),
+  ];
+  const seen = new Set<string>();
+  const out: PendingAlertLeg[] = [];
+  for (const d of ordered) {
+    const key = `${d.side}:${d.token.id.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(
+      d.side === "sell"
+        ? { side: "sell", id: d.token.id, symbol: d.token.symbol, sellFraction: sellFractionOf(d) }
+        : { side: "buy", id: d.token.id, symbol: d.token.symbol },
+    );
+    if (out.length >= MAX_ALERT_ACTION_BUTTONS) break;
+  }
+  return out;
+}
+
+/**
+ * How much of a token a Sell tap sells, in raw units: the stored
+ * fraction of the user's CURRENT balance, floored. A missing or
+ * invalid fraction sells the full holding. Zero balance sells zero.
+ * Pure, unit tested.
+ */
+export function alertSellAmountRaw(userBalanceRaw: bigint, sellFraction: number | undefined): bigint {
+  if (userBalanceRaw <= 0n) return 0n;
+  const fraction = clampSellFraction(sellFraction);
+  if (fraction >= 1) return userBalanceRaw;
+  if (fraction <= 0) return 0n;
+  return BigInt(Math.floor(Number(userBalanceRaw) * fraction));
+}
+
+/**
+ * The keyboard under a trader alert: one row per leg, a "Buy
+ * <SYMBOL>" button for a bought token or a "Sell <SYMBOL>" button
+ * for a sold one, then a single "Ignore" row at the bottom. An alert
+ * with no legs gets the Ignore row only. Callback data carries only
+ * the pending alert's short id (plus the leg index), never a token
+ * account id, so it stays far under Telegram's 64 byte callback cap.
+ * Pure, unit tested.
+ */
+export function buildAlertKeyboard(alertId: string, legs: PendingAlertLeg[]): InlineKeyboard {
   const kb = new InlineKeyboard();
-  tokens.slice(0, MAX_ALERT_BUY_BUTTONS).forEach((t, i) => {
-    kb.text(`Buy ${t.symbol}`, `alertbuy:${alertId}:${i}`).row();
+  legs.slice(0, MAX_ALERT_ACTION_BUTTONS).forEach((leg, i) => {
+    if (leg.side === "sell") kb.text(`Sell ${leg.symbol}`, `alertsell:${alertId}:${i}`).row();
+    else kb.text(`Buy ${leg.symbol}`, `alertbuy:${alertId}:${i}`).row();
   });
   kb.text("Ignore", `alertign:${alertId}`);
   return kb;
@@ -270,11 +343,13 @@ export async function watchTick(): Promise<void> {
           // own buttons; the record is how a later tap finds the tokens
           // and the message to edit, since callback data carries only
           // the short record id.
+          const legs = alertLegs(events, config.wnearId);
           const alert: PendingAlert = {
             id: newPendingAlertId(),
             telegramId: w.ownerTelegramId,
             traderAccountId: w.accountId,
             tokens: alertBoughtTokens(events, config.wnearId),
+            legs,
             text: fullText,
             createdAt: new Date().toISOString(),
           };
@@ -282,7 +357,7 @@ export async function watchTick(): Promise<void> {
           const sent = await notifyAlert(
             w.ownerTelegramId,
             fullText,
-            buildAlertKeyboard(alert.id, alert.tokens),
+            buildAlertKeyboard(alert.id, legs),
           );
           if (sent) {
             alert.chatId = sent.chatId;

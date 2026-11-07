@@ -204,11 +204,17 @@ a single message, sells stated before buys, and when any other token
 moved in the same poll the wNEAR leg is left out of the text, since it
 is the payment plumbing of the trade rather than a trade of its own.
 Every alert carries buttons: one Buy button per token the trader
-bought (up to three) and an Ignore button that dismisses the alert.
-Buy spends NEAR from your main wallet at your AI per trade size when
-you have one set, otherwise ALERT_BUY_NEAR (0.1 NEAR), and
-MAX_TRADE_NEAR always caps it. Buttons live for one hour and work
-only for the user the alert was sent to.
+bought and one Sell button per token they sold (up to three action
+rows in total, in the order the legs appear in the alert), plus an
+Ignore button that dismisses the alert. Buy spends NEAR from your
+main wallet at your AI per trade size when you have one set,
+otherwise ALERT_BUY_NEAR (0.1 NEAR), and MAX_TRADE_NEAR always caps
+it. Sell mirrors the trader proportionally: the button sells the
+same fraction of your own holding of that token that the trader
+sold of theirs, worked out against your live balance when you tap
+it (if the fraction cannot be known, it sells your full holding).
+Buttons live for one hour and work only for the user the alert was
+sent to.
 
 ### AI auto trading
 

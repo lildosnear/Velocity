@@ -6,6 +6,7 @@ import {
   accountExists,
   createWallet,
   readFtBalance,
+  readFtBalanceRaw,
   readNearBalance,
   transferNear,
 } from "./near";
@@ -17,7 +18,7 @@ import {
   payBalance,
   resolveToken,
 } from "./market";
-import { getTokenPriceNear } from "./prices";
+import { getTokenPriceNear, tokenDecimals } from "./prices";
 import {
   attemptNameForNewUser,
   candidateLabelFor,
@@ -29,7 +30,7 @@ import {
   sanitizeLabel,
 } from "./names";
 import { aiActive } from "./copy";
-import { alertBuyAmountNear, getHoldings } from "./watcher";
+import { alertBuyAmountNear, alertSellAmountRaw, getHoldings } from "./watcher";
 import { pnlCaption, realizedCardInput, renderPnlCard, unrealizedCardInput } from "./share/pnl";
 
 const FAUCET = "https://faucet.fastnear.com";
@@ -526,8 +527,9 @@ export function registerCommands(bot: Bot) {
   // --- Trader alert buttons -------------------------------------------------
   // The pending alert record (see store.ts) is the source of truth for
   // a tap: callback data carries only its short id. A tap resolves in
-  // one of three ways: expired (record gone or past the one hour TTL),
-  // refused (the alert belongs to another user), or acted on.
+  // one of three ways: expired (record gone, past the one hour TTL, or
+  // written before alert legs existed), refused (the alert belongs to
+  // another user), or acted on.
 
   /** Remove the keyboard from the message a callback was tapped on. */
   async function stripAlertKeyboard(ctx: any, alert?: PendingAlert) {
@@ -556,7 +558,7 @@ export function registerCommands(bot: Bot) {
    */
   async function gateAlertTap(ctx: any, alertId: string): Promise<PendingAlert | undefined> {
     const alert = store.getPendingAlert(alertId);
-    if (!alert || pendingAlertExpired(alert)) {
+    if (!alert || pendingAlertExpired(alert) || !Array.isArray(alert.legs)) {
       await ctx.answerCallbackQuery({ text: "This alert has expired." }).catch(() => {});
       await stripAlertKeyboard(ctx, alert);
       if (alert) store.deletePendingAlert(alert.id);
@@ -580,13 +582,14 @@ export function registerCommands(bot: Bot) {
   bot.callbackQuery(/^alertbuy:([^:]+):(\d+)$/, async (ctx) => {
     const alert = await gateAlertTap(ctx, ctx.match[1]);
     if (!alert) return;
-    const token = alert.tokens[Number(ctx.match[2])];
-    if (!token) {
+    const leg = alert.legs?.[Number(ctx.match[2])];
+    if (!leg || leg.side !== "buy") {
       await ctx.answerCallbackQuery({ text: "This alert has expired." }).catch(() => {});
       await stripAlertKeyboard(ctx, alert);
       store.deletePendingAlert(alert.id);
       return;
     }
+    const token = { id: leg.id, symbol: leg.symbol };
     const user = store.getUser(ctx.from.id);
     if (!user) {
       await ctx.answerCallbackQuery({ text: "Open the bot with /start first." }).catch(() => {});
@@ -605,6 +608,60 @@ export function registerCommands(bot: Bot) {
     } catch (err: any) {
       // Keyboard stays in place so the user can retry or ignore.
       await ctx.reply(`Alert buy failed: ${err?.message ?? err}`);
+    }
+  });
+
+  bot.callbackQuery(/^alertsell:([^:]+):(\d+)$/, async (ctx) => {
+    const alert = await gateAlertTap(ctx, ctx.match[1]);
+    if (!alert) return;
+    const leg = alert.legs?.[Number(ctx.match[2])];
+    if (!leg || leg.side !== "sell") {
+      await ctx.answerCallbackQuery({ text: "This alert has expired." }).catch(() => {});
+      await stripAlertKeyboard(ctx, alert);
+      store.deletePendingAlert(alert.id);
+      return;
+    }
+    const user = store.getUser(ctx.from.id);
+    if (!user) {
+      await ctx.answerCallbackQuery({ text: "Open the bot with /start first." }).catch(() => {});
+      return;
+    }
+    // The amount is the fraction the trader sold, applied to the
+    // user's CURRENT balance, read live now rather than at alert
+    // time. Work it out before answering the tap, so a user holding
+    // none gets a plain no instead of a trade attempt.
+    let amountRaw: bigint;
+    let decimals: number;
+    try {
+      decimals = await tokenDecimals(leg.id);
+      const balanceRaw = await readFtBalanceRaw(leg.id, user.accountId);
+      amountRaw = alertSellAmountRaw(balanceRaw, leg.sellFraction);
+    } catch (err: any) {
+      await ctx.answerCallbackQuery().catch(() => {});
+      await ctx.reply(`Alert sell failed: ${err?.message ?? err}`);
+      return;
+    }
+    if (!(amountRaw > 0n)) {
+      await ctx.answerCallbackQuery({ text: `You hold no ${leg.symbol}.` }).catch(() => {});
+      await ctx.reply(
+        `That alert was the trader selling ${leg.symbol}, but you hold none of it, so there is nothing to sell.`,
+      );
+      return;
+    }
+    // Answer now so Telegram does not spin while the swap runs.
+    await ctx.answerCallbackQuery({ text: `Selling ${leg.symbol}...` }).catch(() => {});
+    try {
+      const tokenAmount = Number(amountRaw) / 10 ** decimals;
+      const result = await executeSell(user, leg.id, tokenAmount, user.payCurrency);
+      store.deletePendingAlert(alert.id);
+      await rewriteAlertMessage(
+        ctx,
+        alert,
+        `${alert.text}\nYou sold ${fmt(result.tokenAmount, 2)} ${result.symbol} for ${fmt(result.payAmount, 4)} ${result.payCurrency}.`,
+      );
+    } catch (err: any) {
+      // Keyboard stays in place so the user can retry or ignore.
+      await ctx.reply(`Alert sell failed: ${err?.message ?? err}`);
     }
   });
 
