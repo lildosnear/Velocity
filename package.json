@@ -28,7 +28,8 @@
     "smoke": "tsx src/smoke.ts",
     "start": "node dist/index.js",
     "recover-proof": "tsx scripts/recover-proof.ts",
-    "test": "tsx --test tests/fees.test.ts tests/pnl.test.ts tests/quotes.test.ts tests/dcl.test.ts tests/rpc.test.ts tests/names.test.ts tests/nameprompt.test.ts tests/watcher.test.ts tests/alerts.test.ts tests/network.test.ts tests/recover.test.ts tests/signed.test.ts tests/store.test.ts tests/locks.test.ts tests/watcher-state.test.ts",
+    "copy-proof": "tsx scripts/copy-proof.ts",
+    "test": "tsx --test tests/fees.test.ts tests/pnl.test.ts tests/quotes.test.ts tests/dcl.test.ts tests/rpc.test.ts tests/names.test.ts tests/nameprompt.test.ts tests/watcher.test.ts tests/alerts.test.ts tests/network.test.ts tests/recover.test.ts tests/signed.test.ts tests/store.test.ts tests/locks.test.ts tests/watcher-state.test.ts tests/copy.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "type": "commonjs",

@@ -405,6 +405,42 @@ with the address, as the best effort sweep is designed to do (the
 NEAR leg reads the balance once, and that read can land while the
 token sweep's calls are still settling).
 
+AI copy trading has its own proof: `npm run copy-proof`. It runs the
+whole chain live on testnet with the bot's real watcher and copy
+engine, a scratch store, and notifications printed where Telegram
+would receive them. The run on 2026-11-08: a fresh trader account
+(4679e227ed43e826f5940aae6f3ab69f53777f8513720a79709def47b5db1623)
+bought BANANA with 0.2 NEAR through pool 11 (wrap
+Bs4cS81dZG5CLzMJsaUiNBSVPfsqGRTd8bFsSTsz7hcd, deposit
+6oqKGd3wxSffKriD7MwkRbXmdZTQ6APUWvXhyzqLpaU6, swap
+6haqstCFTbbj5xeEHW15kLYzN3fjWftdHa68Wxawc4U7, withdraw
+BQo9iRQS7k2XQSehrSo9Wig3Jxip3ftL2NtNJyyEhdvY) and received
+5338.682273 BANANA. One watcher tick later the proof user's AI
+wallet had copied the buy at its configured 0.1 NEAR per trade size,
+receiving 2629.78 BANANA, exactly the fresh quote (swap
+Bc2wGsMe3HAFJLDPqA5DCs8CfkL2XXGbD2XG6s8Bdfo5 in the copy's
+transaction set 6AL4T4cBPThLoN1M4pCRtEMdfyFALRVAT2shQ1NKzh95,
+HMh9UeMbFb2EceaC6PTwQw4fNjEPqcf3oLViizyfkMJt,
+Bc2wGsMe3HAFJLDPqA5DCs8CfkL2XXGbD2XG6s8Bdfo5,
+AvT7BMPW2zP7L9haYYdq3bWAogbf9BkFpSiuyPUB8akC), with the position
+record matching the chain balance to the raw unit and the user's
+main wallet untouched to the yocto. The trader then sold half their
+BANANA (2669.34, proceeds 0.1009 NEAR, swap
+6NpAQ8W3XSfHyznT8MhRjhCtGvwbvXMnbJ6P2iA9pZff); the AI mirrored it
+proportionally, selling 1314.89 BANANA, exactly half its position,
+for 0.0493 NEAR (swap A7QExGQwLPPNyts9ip7CdD1ofFAhN1Exzwepv7gBXPEN),
+a realized P&L of -0.000672 NEAR against a 5 NEAR daily loss limit,
+which did not trip. The same run exercised the per trade cap live:
+a second user whose per trade size was set to 11 NEAR against the
+10 NEAR cap, with an AI wallet funded past that size, had its copy
+refused before anything was signed ("AI copy skipped: your per
+trade size of 11 NEAR is worth about 11.00 NEAR, over the per trade
+cap of 10 NEAR"), its balance exact afterwards. That refusal is
+enforced in the copy engine itself, at the point of spending; it
+previously lived only in the /ai setup command, which could be
+sidestepped by changing pay currency after setup or by the operator
+lowering the cap.
+
 ## MAINNET
 
 Velocity is mainnet ready as of 2026-11-07. With NEAR_NETWORK=mainnet

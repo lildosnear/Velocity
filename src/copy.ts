@@ -4,7 +4,7 @@ import { store, type AiConfig, type CopyPosition, type UserRecord } from "./stor
 import { UserBusyError, withUserLock } from "./locks";
 import { notify } from "./notifier";
 import { payBalance, swapBuy, swapSell } from "./market";
-import { getTokenPriceNear, tokenDecimals } from "./prices";
+import { getNearValueOfFt, getTokenPriceNear, tokenDecimals } from "./prices";
 import type { WalletCreds } from "./near";
 import type { WalletTradeEvent } from "./watcher";
 
@@ -73,6 +73,29 @@ function checkDailyLimit(user: UserRecord, ai: AiConfig): boolean {
   return true;
 }
 
+/** True when a NEAR value is over the per trade cap. Pure, unit tested. */
+export function isOverTradeCap(nearValue: number, maxTradeNear: number): boolean {
+  return nearValue > maxTradeNear;
+}
+
+/**
+ * The NEAR value a copy buy of perTradeAmount in the given pay
+ * currency represents, for the per trade cap. Native NEAR is exact.
+ * For a fungible token pay currency the value is estimated from pool
+ * prices, mirroring executeBuy; when no estimate can be made this
+ * returns 0 and the cap does not block, exactly as executeBuy treats
+ * an unpriceable trade.
+ */
+export async function copyBuyNearValue(currencyId: string, perTradeAmount: number): Promise<number> {
+  const currency = getPayCurrency(currencyId);
+  if (currency.kind === "native") return perTradeAmount;
+  try {
+    return await getNearValueOfFt(payCurrencyTokenId(currency.id), perTradeAmount, currency.decimals);
+  } catch {
+    return 0;
+  }
+}
+
 /** Trader bought -> AI buys perTradeAmount worth (in the user's pay currency). */
 export async function onTraderBuy(event: WalletTradeEvent): Promise<void> {
   if (!config.tradingEnabled) return; // trading paused: copy executions stay quiet, alerts still flow
@@ -87,6 +110,21 @@ export async function onTraderBuy(event: WalletTradeEvent): Promise<void> {
     const currencyId = user.payCurrency;
     const token = event.token;
     if (token.id === payCurrencyTokenId(currencyId)) return; // trader moved the pay token itself, nothing to copy
+
+    // The per trade cap is enforced here, at the point of spending,
+    // not only at /ai setup time: the stored per trade size can
+    // predate a cap change, or the setup was priced in another pay
+    // currency. Manual trades enforce the same cap inside
+    // executeBuy; a copy must never spend past it either.
+    const nearValue = await copyBuyNearValue(currencyId, ai.perTradeAmount);
+    if (isOverTradeCap(nearValue, config.maxTradeNear)) {
+      await notify(
+        user.telegramId,
+        `AI copy skipped: your per trade size of ${ai.perTradeAmount} ${currencyId} is worth about ` +
+          `${nearValue.toFixed(2)} NEAR, over the per trade cap of ${config.maxTradeNear} NEAR. No trade was placed.`,
+      );
+      return;
+    }
 
     const creds = aiCreds(ai);
     const balance = await payBalance(creds, currencyId);
