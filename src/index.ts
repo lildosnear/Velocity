@@ -2,7 +2,7 @@ import { Bot } from "grammy";
 import { config } from "./config";
 import { rpcBlockHeight } from "./near";
 import { registerCommands } from "./commands";
-import { setSender } from "./notifier";
+import { setAlertSender, setSender } from "./notifier";
 import { startWatcher, watchTick } from "./watcher";
 import { stopLossTick } from "./copy";
 
@@ -28,6 +28,13 @@ async function main() {
   // Background jobs talk back to users through the notifier.
   setSender(async (telegramId, text) => {
     await bot.api.sendMessage(telegramId, text);
+  });
+
+  // Trader alerts go out with their Buy and Ignore keyboard, and the
+  // watcher records where each one landed so taps can edit it later.
+  setAlertSender(async (telegramId, text, keyboard) => {
+    const msg = await bot.api.sendMessage(telegramId, text, { reply_markup: keyboard });
+    return { chatId: msg.chat.id, messageId: msg.message_id };
   });
 
   // Wallet watcher plus stop loss checker.

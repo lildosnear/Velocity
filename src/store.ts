@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { config } from "./config";
 import type { EncryptedKey } from "./crypto";
@@ -88,6 +89,63 @@ export interface PendingSettlement {
   txids: string[];
 }
 
+export interface PendingAlertToken {
+  /** fungible token contract account id */
+  id: string;
+  symbol: string;
+}
+
+/**
+ * One trader alert that carries Buy and Ignore buttons, kept so a
+ * button tap can be resolved without putting token account ids in the
+ * callback data (Telegram caps callback data at 64 bytes and NEAR ids
+ * can be long). The record is per receiving user: every watcher gets
+ * their own alert message, their own record and their own buttons, and
+ * one user acting on theirs never touches another user's copy. Records
+ * expire one hour after the alert was sent.
+ */
+export interface PendingAlert {
+  /** short random id, the only thing the callback data carries */
+  id: string;
+  /** the user this alert was sent to; only they may use its buttons */
+  telegramId: number;
+  /** NEAR account id of the trader whose move triggered the alert */
+  traderAccountId: string;
+  /** tokens the trader bought in this alert, in alert order (button order) */
+  tokens: PendingAlertToken[];
+  /** the full alert text as sent, so taps can append a line to it */
+  text: string;
+  /** where the alert message lives, filled in once Telegram confirms the send */
+  chatId?: number;
+  messageId?: number;
+  createdAt: string;
+}
+
+/** Pending alerts live for one hour after the alert is sent. */
+export const PENDING_ALERT_TTL_MS = 60 * 60 * 1000;
+
+/** Short random id for callback data: 10 hex chars keeps callbacks far under the 64 byte cap. */
+export function newPendingAlertId(): string {
+  return randomBytes(5).toString("hex");
+}
+
+export function pendingAlertExpired(alert: PendingAlert, now = Date.now()): boolean {
+  const created = Date.parse(alert.createdAt);
+  return !Number.isFinite(created) || now - created >= PENDING_ALERT_TTL_MS;
+}
+
+/** Drop every record at or past the TTL. Pure, unit tested. */
+export function prunePendingAlerts(
+  alerts: Record<string, PendingAlert>,
+  now = Date.now(),
+): Record<string, PendingAlert> {
+  const out: Record<string, PendingAlert> = {};
+  for (const [id, alert] of Object.entries(alerts)) {
+    if (!pendingAlertExpired(alert, now)) out[id] = alert;
+  }
+  return out;
+}
+
 export interface WatchedWallet {
   id: string;
   ownerTelegramId: number;
@@ -130,18 +188,22 @@ interface StoreShape {
   trades: TradeRecord[];
   pendingSettlements: PendingSettlement[];
   watched: Record<string, WatchedWallet>;
+  pendingAlerts: Record<string, PendingAlert>;
 }
 
 const storePath = join(config.dataDir, "store.json");
 
 function load(): StoreShape {
-  if (!existsSync(storePath)) return { users: {}, trades: [], pendingSettlements: [], watched: {} };
+  if (!existsSync(storePath)) {
+    return { users: {}, trades: [], pendingSettlements: [], watched: {}, pendingAlerts: {} };
+  }
   const parsed = JSON.parse(readFileSync(storePath, "utf8")) as Partial<StoreShape>;
   return {
     users: parsed.users ?? {},
     trades: parsed.trades ?? [],
     pendingSettlements: parsed.pendingSettlements ?? [],
     watched: parsed.watched ?? {},
+    pendingAlerts: parsed.pendingAlerts ?? {},
   };
 }
 
@@ -197,6 +259,23 @@ export const store = {
   /** Full trade history for a user, used for cost basis and PnL math. */
   userTrades(telegramId: number): TradeRecord[] {
     return load().trades.filter((t) => t.telegramId === telegramId);
+  },
+  /** Save a pending alert. Every write first prunes records past the one hour TTL. */
+  savePendingAlert(alert: PendingAlert): void {
+    const shape = load();
+    shape.pendingAlerts = prunePendingAlerts(shape.pendingAlerts);
+    shape.pendingAlerts[alert.id] = alert;
+    save(shape);
+  },
+  getPendingAlert(id: string): PendingAlert | undefined {
+    return load().pendingAlerts[id];
+  },
+  deletePendingAlert(id: string): void {
+    const shape = load();
+    if (shape.pendingAlerts[id]) {
+      delete shape.pendingAlerts[id];
+      save(shape);
+    }
   },
 };
 

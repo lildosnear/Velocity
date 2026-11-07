@@ -190,6 +190,12 @@ export const config = {
   maxTradeNear: Number(optional("MAX_TRADE_NEAR", "10")),
   priceTtlSecs: Number(optional("PRICE_TTL_SECS", "15")),
   watchPollSecs: Number(optional("WATCH_POLL_SECS", "20")),
+  /**
+   * NEAR spent when a user taps a trader alert's Buy button and has no
+   * AI per trade size configured (see ALERT_BUY_NEAR). With an AI size
+   * set, the button uses that size instead. MAX_TRADE_NEAR caps both.
+   */
+  alertBuyNear: Number(optional("ALERT_BUY_NEAR", "0.1")),
   botUsername: optional("BOT_USERNAME", ""),
   referralEnabled: optional("REFERRAL_ENABLED", "true") === "true",
   refereeDiscountPct: Number(optional("REFEREE_DISCOUNT_PCT", "25")),

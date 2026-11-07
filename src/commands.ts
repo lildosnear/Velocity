@@ -1,7 +1,7 @@
 import { Bot, InlineKeyboard, InputFile } from "grammy";
 import { config, findKnownToken, getPayCurrency } from "./config";
 import { decryptPrivateKey, encryptPrivateKey } from "./crypto";
-import { store, type TradedToken } from "./store";
+import { pendingAlertExpired, store, type PendingAlert, type TradedToken } from "./store";
 import {
   accountExists,
   createWallet,
@@ -29,7 +29,7 @@ import {
   sanitizeLabel,
 } from "./names";
 import { aiActive } from "./copy";
-import { getHoldings } from "./watcher";
+import { alertBuyAmountNear, getHoldings } from "./watcher";
 import { pnlCaption, realizedCardInput, renderPnlCard, unrealizedCardInput } from "./share/pnl";
 
 const FAUCET = "https://faucet.fastnear.com";
@@ -520,6 +520,91 @@ export function registerCommands(bot: Bot) {
       await ctx.reply(`Could not build the card: ${err?.message ?? err}`);
     } finally {
       await ctx.api.deleteMessage(wait.chat.id, wait.message_id).catch(() => {});
+    }
+  });
+
+  // --- Trader alert buttons -------------------------------------------------
+  // The pending alert record (see store.ts) is the source of truth for
+  // a tap: callback data carries only its short id. A tap resolves in
+  // one of three ways: expired (record gone or past the one hour TTL),
+  // refused (the alert belongs to another user), or acted on.
+
+  /** Remove the keyboard from the message a callback was tapped on. */
+  async function stripAlertKeyboard(ctx: any, alert?: PendingAlert) {
+    const chatId = alert?.chatId ?? ctx.chat?.id;
+    const messageId = alert?.messageId ?? ctx.callbackQuery?.message?.message_id;
+    if (chatId && messageId) {
+      await ctx.api
+        .editMessageReplyMarkup(chatId, messageId, { reply_markup: new InlineKeyboard() })
+        .catch(() => {});
+    }
+  }
+
+  /** Replace the alert message text (editing the text drops its keyboard). */
+  async function rewriteAlertMessage(ctx: any, alert: PendingAlert, newText: string) {
+    const chatId = alert.chatId ?? ctx.chat?.id;
+    const messageId = alert.messageId ?? ctx.callbackQuery?.message?.message_id;
+    if (chatId && messageId) {
+      await ctx.api.editMessageText(chatId, messageId, newText).catch(() => {});
+    }
+  }
+
+  /**
+   * Shared gate for both alert buttons. Returns the record when the
+   * tap may proceed, or undefined after the tap has been answered and
+   * any dead keyboard stripped.
+   */
+  async function gateAlertTap(ctx: any, alertId: string): Promise<PendingAlert | undefined> {
+    const alert = store.getPendingAlert(alertId);
+    if (!alert || pendingAlertExpired(alert)) {
+      await ctx.answerCallbackQuery({ text: "This alert has expired." }).catch(() => {});
+      await stripAlertKeyboard(ctx, alert);
+      if (alert) store.deletePendingAlert(alert.id);
+      return undefined;
+    }
+    if (alert.telegramId !== ctx.from.id) {
+      await ctx.answerCallbackQuery({ text: "This alert belongs to another user." }).catch(() => {});
+      return undefined;
+    }
+    return alert;
+  }
+
+  bot.callbackQuery(/^alertign:(.+)$/, async (ctx) => {
+    const alert = await gateAlertTap(ctx, ctx.match[1]);
+    if (!alert) return;
+    store.deletePendingAlert(alert.id);
+    await ctx.answerCallbackQuery().catch(() => {});
+    await rewriteAlertMessage(ctx, alert, `${alert.text}\nIgnored.`);
+  });
+
+  bot.callbackQuery(/^alertbuy:([^:]+):(\d+)$/, async (ctx) => {
+    const alert = await gateAlertTap(ctx, ctx.match[1]);
+    if (!alert) return;
+    const token = alert.tokens[Number(ctx.match[2])];
+    if (!token) {
+      await ctx.answerCallbackQuery({ text: "This alert has expired." }).catch(() => {});
+      await stripAlertKeyboard(ctx, alert);
+      store.deletePendingAlert(alert.id);
+      return;
+    }
+    const user = store.getUser(ctx.from.id);
+    if (!user) {
+      await ctx.answerCallbackQuery({ text: "Open the bot with /start first." }).catch(() => {});
+      return;
+    }
+    // Answer now so Telegram does not spin while the swap runs.
+    await ctx.answerCallbackQuery({ text: `Buying ${token.symbol}...` }).catch(() => {});
+    try {
+      const result = await executeBuy(user, token.id, alertBuyAmountNear(user), "NEAR");
+      store.deletePendingAlert(alert.id);
+      await rewriteAlertMessage(
+        ctx,
+        alert,
+        `${alert.text}\nYou bought ${fmt(result.tokenAmount, 2)} ${result.symbol} for ${fmt(result.payAmount, 4)} NEAR.`,
+      );
+    } catch (err: any) {
+      // Keyboard stays in place so the user can retry or ignore.
+      await ctx.reply(`Alert buy failed: ${err?.message ?? err}`);
     }
   });
 

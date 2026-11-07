@@ -203,6 +203,12 @@ Alerts are aggregated: all of an account's diffs in one poll arrive as
 a single message, sells stated before buys, and when any other token
 moved in the same poll the wNEAR leg is left out of the text, since it
 is the payment plumbing of the trade rather than a trade of its own.
+Every alert carries buttons: one Buy button per token the trader
+bought (up to three) and an Ignore button that dismisses the alert.
+Buy spends NEAR from your main wallet at your AI per trade size when
+you have one set, otherwise ALERT_BUY_NEAR (0.1 NEAR), and
+MAX_TRADE_NEAR always caps it. Buttons live for one hour and work
+only for the user the alert was sent to.
 
 ### AI auto trading
 

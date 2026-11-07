@@ -1,8 +1,15 @@
+import { InlineKeyboard } from "grammy";
 import { config } from "./config";
 import { readFtBalanceRaw } from "./near";
-import { type TradedToken, type WatchedWallet } from "./store";
-import { store } from "./store";
-import { notify } from "./notifier";
+import {
+  type PendingAlert,
+  type PendingAlertToken,
+  type TradedToken,
+  type UserRecord,
+  type WatchedWallet,
+} from "./store";
+import { newPendingAlertId, store } from "./store";
+import { notify, notifyAlert } from "./notifier";
 import { onTraderBuy, onTraderSell } from "./copy";
 import { watchTokenSet } from "./discovery";
 
@@ -24,6 +31,9 @@ import { watchTokenSet } from "./discovery";
  * is left out of the text; a tick where only wNEAR moved (a wrap, an
  * unwrap, a plain transfer) still alerts on its own. The copy engine
  * is unaffected: it keeps consuming the per token diffs one by one.
+ * Each alert also carries Buy and Ignore buttons for its receiver
+ * only (see buildAlertKeyboard and the pending alert records in the
+ * store); the taps are handled in commands.ts.
  *
  * Honest limits:
  * - We cannot distinguish a buy from a plain transfer in (or a sell from
@@ -102,15 +112,25 @@ function joinList(items: string[]): string {
 }
 
 /**
+ * The diffs an alert actually talks about, after the wNEAR rule: if
+ * any other token moved in the same tick, every wNEAR diff is dropped,
+ * because it is the payment rail of that trade (the wrap in, the
+ * payment out) and reads as noise that cancels itself out. If wNEAR
+ * is the only token that moved, its diff is a real event on its own
+ * and is kept. The alert text and the alert buttons both read from
+ * this same set, so the buttons always match the words. Pure.
+ */
+export function shownDiffs(diffs: TraderAlertDiff[], wnearId: string): TraderAlertDiff[] {
+  if (diffs.length === 0) return [];
+  const wnear = wnearId.toLowerCase();
+  const hasOtherToken = diffs.some((d) => d.token.id.toLowerCase() !== wnear);
+  return hasOtherToken ? diffs.filter((d) => d.token.id.toLowerCase() !== wnear) : diffs;
+}
+
+/**
  * Compose ONE trader alert from every balance diff a watched account
  * produced in a single tick. Sells are stated before buys; several
  * tokens on one side list with commas and "and" before the last.
- *
- * The wNEAR rule: if any other token moved in the same tick, every
- * wNEAR diff is dropped from the text, because it is the payment rail
- * of that trade (the wrap in, the payment out) and reads as noise that
- * cancels itself out. If wNEAR is the only token that moved, its diff
- * is a real event on its own and is kept.
  *
  * Pure and exported for tests. Returns undefined when there is nothing
  * to say.
@@ -120,10 +140,7 @@ export function composeTraderAlert(
   diffs: TraderAlertDiff[],
   wnearId: string,
 ): string | undefined {
-  if (diffs.length === 0) return undefined;
-  const wnear = wnearId.toLowerCase();
-  const hasOtherToken = diffs.some((d) => d.token.id.toLowerCase() !== wnear);
-  const shown = hasOtherToken ? diffs.filter((d) => d.token.id.toLowerCase() !== wnear) : diffs;
+  const shown = shownDiffs(diffs, wnearId);
   if (shown.length === 0) return undefined;
 
   const leg = (d: TraderAlertDiff) => `${fmtAlertAmount(d.amountTokens)} ${d.token.symbol}`;
@@ -134,6 +151,60 @@ export function composeTraderAlert(
   if (buys.length > 0) parts.push(`bought ${joinList(buys.map(leg))}`);
   if (parts.length === 0) return undefined;
   return `Trader alert: ${accountLabel} ${parts.join(" and ")}.`;
+}
+
+/** At most this many Buy buttons ride on one alert. */
+export const MAX_ALERT_BUY_BUTTONS = 3;
+
+/**
+ * The tokens an alert offers Buy buttons for: the bought side of the
+ * shown diffs, deduplicated, in alert order, capped at
+ * MAX_ALERT_BUY_BUTTONS. Pure.
+ */
+export function alertBoughtTokens(
+  diffs: TraderAlertDiff[],
+  wnearId: string,
+): PendingAlertToken[] {
+  const seen = new Set<string>();
+  const out: PendingAlertToken[] = [];
+  for (const d of shownDiffs(diffs, wnearId)) {
+    if (d.side !== "buy") continue;
+    const key = d.token.id.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ id: d.token.id, symbol: d.token.symbol });
+    if (out.length >= MAX_ALERT_BUY_BUTTONS) break;
+  }
+  return out;
+}
+
+/**
+ * The keyboard under a trader alert: one row per bought token with a
+ * "Buy <SYMBOL>" button, then a single "Ignore" row at the bottom. An
+ * alert with no buy leg gets the Ignore row only. Callback data
+ * carries only the pending alert's short id (plus the token index for
+ * buys), never a token account id, so it stays far under Telegram's
+ * 64 byte callback cap. Pure, unit tested.
+ */
+export function buildAlertKeyboard(alertId: string, tokens: PendingAlertToken[]): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  tokens.slice(0, MAX_ALERT_BUY_BUTTONS).forEach((t, i) => {
+    kb.text(`Buy ${t.symbol}`, `alertbuy:${alertId}:${i}`).row();
+  });
+  kb.text("Ignore", `alertign:${alertId}`);
+  return kb;
+}
+
+/**
+ * NEAR an alert Buy tap spends: the user's configured AI copy per
+ * trade size when they have one set, otherwise ALERT_BUY_NEAR
+ * (0.1 NEAR by default). MAX_TRADE_NEAR caps both. Pure, unit tested.
+ */
+export function alertBuyAmountNear(user: { ai?: { perTradeAmount?: number } }): number {
+  const aiSize = user.ai?.perTradeAmount;
+  const fallback = config.alertBuyNear > 0 ? config.alertBuyNear : 0.1;
+  const base = aiSize != null && aiSize > 0 ? aiSize : fallback;
+  return Math.min(base, config.maxTradeNear);
 }
 
 export async function watchTick(): Promise<void> {
@@ -194,10 +265,30 @@ export async function watchTick(): Promise<void> {
       if (events.length > 0) {
         const text = composeTraderAlert(short(w.accountId), events, config.wnearId);
         if (text) {
-          await notify(
+          const fullText = text + (w.mode === "auto" ? "\nAuto copy is ON, working on it..." : "");
+          // Every watcher gets their own pending alert record and their
+          // own buttons; the record is how a later tap finds the tokens
+          // and the message to edit, since callback data carries only
+          // the short record id.
+          const alert: PendingAlert = {
+            id: newPendingAlertId(),
+            telegramId: w.ownerTelegramId,
+            traderAccountId: w.accountId,
+            tokens: alertBoughtTokens(events, config.wnearId),
+            text: fullText,
+            createdAt: new Date().toISOString(),
+          };
+          store.savePendingAlert(alert);
+          const sent = await notifyAlert(
             w.ownerTelegramId,
-            text + (w.mode === "auto" ? "\nAuto copy is ON, working on it..." : ""),
+            fullText,
+            buildAlertKeyboard(alert.id, alert.tokens),
           );
+          if (sent) {
+            alert.chatId = sent.chatId;
+            alert.messageId = sent.messageId;
+            store.savePendingAlert(alert);
+          }
         }
 
         if (w.mode === "auto") {
