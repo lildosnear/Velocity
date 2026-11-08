@@ -1028,7 +1028,9 @@ export function registerCommands(
       const bal = await readNearBalance(ai.accountId);
       const lines = [
         `AI: ${active ? "ON" : "OFF" + (ai.pausedUntil ? " (paused, daily limit hit)" : "")}`,
+        `AI wallet: ${ai.accountId}`,
         `AI wallet NEAR: ${bal.toFixed(6)}`,
+        "To top it up, send NEAR to the AI wallet address above from any wallet.",
         `Per trade: ${ai.perTradeAmount} ${user.payCurrency}`,
         `Daily loss limit: ${ai.dailyLossLimitNear ?? "none"} NEAR`,
         `Stop loss: ${ai.stopLossPct != null ? `${(ai.stopLossPct * 100).toFixed(0)}%` : "none"}`,
